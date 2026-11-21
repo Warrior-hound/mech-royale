@@ -1,0 +1,72 @@
+# survivor-v1: a survival-first mechfight/1 bot
+
+One Python file per concern, standard library only (no pip installs), so the image builds in seconds
+and nothing can break at build time.
+
+| File | Role |
+| --- | --- |
+| `bot.py` | the decision logic (`Bot.act`), run by `mechfight.run` |
+| `world.py` | static map model built once at `hello` from `/arena` (about 2 s), plus incremental A* |
+| `mechfight.py` | the kit's wrapper, unchanged (stdin/stdout loop, newest-observation rule, debug drawing) |
+| `Dockerfile` | `python:3.13.1-slim-bookworm` pinned by digest, runs as uid 65534, writes nothing to disk |
+
+## Map model (`world.py`)
+
+2 m grid over the arena, built from `v2/world.json` and `v2/terrain.i16`:
+
+- **floor**: standing height = terrain, or the top of a building/stadium prism or low bridge deck.
+- **wall / nav**: a cell is navigable if it is standable (no overhang inside the body volume) and no
+  neighbour rises more than the step height (1.2 m + slack) within one cell (body clearance).
+  Moving between cells also requires `floor[next] - floor[here] <= rise`; drops are always allowed.
+- **occ**: highest sight/shot blocker per cell (terrain or building top), for line-of-sight rays.
+- **canopy**: how deep a cell lies inside tree crowns at body height. Deeper than about 4 m hides a
+  mech from viewers beyond the 45 m proximity sensor (crowns block vision, never shots).
+- **AStar**: 8-connected A* that runs incrementally (bounded expansions and a wall-clock deadline per
+  decision), so path planning never threatens the 50 ms budget.
+
+## Behaviour (`bot.py`), in priority order
+
+1. **Zone first.** The goal is the point of the *next* circle closest to us, inset by up to 30 m, so
+   we sit on the edge of the safe area rather than in the contested centre. We start walking there at
+   once. Silent pace (|move| = 0.4, below the 5 m/s step-sound threshold) unless the remaining distance
+   over the time to the shrink's end needs more; out of the zone we run and boost.
+2. **Stay unseen.** When enemies are visible or remembered, after being hit, or when hurt after recent
+   contact, the bot scores up to 37 nearby spots: hidden from each known threat (buildings block a 3D
+   ray from the threat's eye to both our centre and top), or deep in canopy beyond 45 m, far from
+   threats, cheap to reach, and safe from the zone for the next 12 s. Then it walks or boosts there.
+   Threats include visible mechs, nearby NPC drones, the bearing of the last hit and recent hostile
+   sounds (placed at the bucket distance along the heard bearing). Standing still in cover lets the
+   45 HP/s regen run.
+3. **Loot only when quiet.** No hostiles seen or heard for 12 s: take weapons (laser > lightning >
+   mortar, swapping slot 1 when better) and cubes within 90 m / 60 m that lie inside the safe area.
+   Upgrade offers are picked by a survival-first priority list (nanites, plating, armor, reactor, ...).
+4. **Fight only when it pays.** Shoot back at anything that hit us in the last 5 s, at mechs within
+   70 m, and at weak mechs (< 35% HP) within 150 m while we're above 40% HP, and at NPCs only when they
+   attack us. Targets must be in line of sight. Gun shots lead the target (252 m/s intercept) and fire
+   only when the actual torso aim is within the target radius. Laser charges while roughly on target
+   and releases at full charge when on target. Lightning fires inside 43 m when the cone covers the
+   target. Mortar solves the low ballistic arc with lead. The gun reloads when idle and under 6 rounds.
+5. **Awareness.** With no target, the torso faces the last hit bearing, else the nearest threat, else
+   it sweeps around the direction of the zone centre (front, +/-110 deg, behind) to avoid x1.5 rear hits.
+6. **Never stuck, never crash.** No progress for 0.8 s while moving -> jump + jet with a sidestep and a
+   replan. If the walkable graph doesn't reach the goal (closed courtyards, roofs, the stadium bowl),
+   it walks to the closest reachable point and jets over toward the goal. Any exception in `act` returns
+   a safe action (walk to the next circle, keep aim); the wrapper adds a second safety net.
+
+## Timing
+
+All heavy work is precomputed at `hello`. Per decision, the cover search and A* expansion are capped by
+wall-clock time (4 ms and 7 ms). Measured on the kit stream in-process: p50 0.1 ms, p99 4.3 ms,
+max 4.4 ms. Through `docker run --cpus 1 --memory 512m` on a Windows laptop the check reports
+p99 about 20-24 ms, the same as the kit's trivial example bot (p99 25 ms), so that is Docker pipe
+overhead, not bot compute.
+
+## Check it
+
+```sh
+docker build -t survivor-bot .
+python3 check/check.py --map-dir /arena -- docker run --rm -i --network none --cpus 1 --memory 512m \
+  --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 -v "$PWD/arena:/arena:ro" survivor-bot
+```
+
+MIT licensed (see `LICENSE`).
