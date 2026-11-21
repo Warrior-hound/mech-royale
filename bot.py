@@ -141,6 +141,11 @@ PARAMS = {
     # a camp spot is kept while the zone goal is within this distance (the camp cover radius)
     "camp_stay_m": 24.0,
     "cube_dz": 6.0,
+    # card 5 supply drops: capture when within drop_range, no hunter seen/heard for drop_quiet_s and none
+    # known within drop_clear_m of the ring
+    "drop_range": 150.0,
+    "drop_quiet_s": 8.0,
+    "drop_clear_m": 120.0,
     # give up on a loot goal that got no closer by 2 m in this many seconds (blocked climb, bad path)
     "econ_giveup_s": 8.0,
     # I3: keep a chosen movement mode at least this long unless a hard trigger fires
@@ -267,6 +272,7 @@ class Bot:
         self.cmode_t = -99.0
         self.cmode_state = None
         self.prev_los_ids: set = set()
+        self.los_seen: Dict[int, float] = {}
         self.hp_hist: List[Tuple[float, float]] = []
         self.last_dmg_anon_t = -99.0
         k_ie = PARAMS["inner_edge_phases"]
@@ -496,11 +502,13 @@ class Bot:
         off = obs.get("offer")
         if off and off.get("choices"):
             ids = [c.get("id") for c in off["choices"]]
-            best, bi = 999, 0
+            best, bi = None, 0
             for i, cid in enumerate(ids):
                 r = UPGRADE_PRIORITY.index(cid) if cid in UPGRADE_PRIORITY else 50
-                if r < best:
-                    best, bi = r, i
+                # card 6: largest relative gain of HP x DPS first, the fixed priority list breaks ties
+                key = (-round(self.upgrade_gain(cid, me), 3), r)
+                if best is None or key < best:
+                    best, bi = key, i
             act["pick"] = bi
 
         # ---- threats
@@ -663,6 +671,12 @@ class Bot:
         econ_hp = hp >= PARAMS["econ_min_hp"] * mhp or (self.corpse is not None and hp >= PARAMS["retreat_hp"] * mhp)
         if not fighting and chase is None and not out_now and econ_hp and t < self.T["final_center_t"]:
             econ = self.econ_goal(obs, me, x, y, z, t, act, urgent and zdist > 8)
+        # card 5: a supply drop is a full heal, so it is not gated on HP
+        if not fighting and chase is None and not out_now and not shooters and not under_fire \
+                and not (urgent and zdist > 8) and t < self.T["final_center_t"]:
+            dg = self.drop_goal(obs, x, y, t, me.get("id"))
+            if dg is not None:
+                econ = (dg, "drop")
             # with shooters on us, take the trip only when they need several times longer to kill us
             # than the trip takes (a far gunner landing few hits)
             if econ is not None and (shooters or under_fire):
@@ -702,7 +716,7 @@ class Bot:
             speed = 1.0
         elif econ is not None:
             goal, mode = econ
-            speed = 1.0 if (enemies or t < self.arm_t or mode == "corpse") else PARAMS["silent_move"]
+            speed = 1.0 if (enemies or t < self.arm_t or mode in ("corpse", "drop")) else PARAMS["silent_move"]
         elif hide_needed and self.cover is not None:
             goal = self.cover
             mode = "hide"
@@ -761,7 +775,10 @@ class Bot:
         los_ids = {int(m["id"]) for (m, _) in shooters}
         if target is not None and target.get("kind") == "mech":
             los_ids.add(int(target["id"]))
-        new_los = bool(los_ids - self.prev_los_ids)
+        # "new" = no line of sight to that mech in the last 3 s (a flickering sight line is not new)
+        new_los = any(t - self.los_seen.get(i, -99.0) > 3.0 for i in los_ids)
+        for i in los_ids:
+            self.los_seen[i] = t
         self.prev_los_ids = los_ids
         hard = out_now or mode == "zone" or spike or new_los or hp < PARAMS["retreat_hp"] * mhp
         if mode != self.cmode:
@@ -935,6 +952,72 @@ class Bot:
             p = 1.0 if tgt_speed * tt < w.get("splash_radius", 7.0) else 0.4
             return (w.get("splash", 160) * p) / w.get("cooldown", 2.6)
         return 0.0
+
+    def upgrade_gain(self, uid: Any, me: Dict[str, Any]) -> float:
+        """Card 6: relative gain of the strength product HP x DPS from one upgrade (config effects).
+        HP side: max HP multipliers, armor as effective HP, nanites as the extra HP regenerated during the
+        base regen delay. DPS side: damage / cooldown multipliers on held weapons, weighted by that
+        weapon's share of our DPS at a typical 60 m. Utility upgrades count 0 (priority list decides)."""
+        try:
+            up = next((u for u in (self.cfg.get("upgrades") or []) if u.get("id") == uid), None)
+            if not up:
+                return 0.0
+            mech = self.cfg.get("mech") or {}
+            stats = me.get("stats") or {}
+            mhp = max(1.0, me.get("max_hp", 1400.0))
+            kinds = [w.get("kind") for w in (me.get("weapons") or []) if w]
+            dps = {k: self.weapon_dps(k, 60.0, 5.0) for k in kinds}
+            tot = sum(dps.values()) or 1.0
+            gain = 0.0
+            for e in up.get("effects") or []:
+                path, mul, add = e.get("path", ""), e.get("mul"), e.get("add")
+                if path == "mech.hp" and mul:
+                    gain += mul - 1.0
+                elif path == "mech.armor" and add:
+                    a0 = float(stats.get("armor", mech.get("armor", 0.0)) or 0.0)
+                    gain += (1.0 - a0) / max(0.05, 1.0 - a0 - add) - 1.0
+                elif path == "mech.regen_delay" and add:
+                    delay = float(stats.get("regen_delay", mech.get("regen_delay", 5.0)))
+                    rate = float(stats.get("regen_per_s", mech.get("regen_per_s", 45.0)))
+                    rmul = next((x.get("mul", 1.0) for x in up["effects"] if x.get("path") == "mech.regen_per_s"), 1.0)
+                    gain += min(delay, -add) * rate * rmul / mhp
+                elif path.startswith("weapons."):
+                    _, k, field = (path.split(".") + ["", ""])[:3]
+                    if k in dps:
+                        if field == "damage" and mul:
+                            gain += (mul - 1.0) * dps[k] / tot
+                        elif field == "cooldown" and mul:
+                            gain += (1.0 / mul - 1.0) * dps[k] / tot
+            return gain
+        except Exception:
+            return 0.0
+
+    def drop_goal(self, obs, x, y, t, me_id) -> Optional[Tuple[float, float]]:
+        """Card 5: a supply drop (stand alone in its ring for capture_s: +3 cubes, full HP and energy)
+        when it is close, inside the safe zone, landed or landing before we arrive, not held by another
+        mech, and no hunter has been seen or heard for a while."""
+        best, bd = None, PARAMS["drop_range"]
+        if t - self.last_hostile_t < PARAMS["drop_quiet_s"]:
+            return None
+        known = self.known_mechs(t, me_id)
+        for d in obs.get("drops") or []:
+            try:
+                px, py = d["pos"][0], d["pos"][1]
+            except Exception:
+                continue
+            holder = d.get("holder")
+            if holder is not None and holder != -1 and holder != me_id:
+                continue
+            dist = hyp(x, y, px, py)
+            lands = d.get("lands_in") or 0.0
+            if dist > bd or lands > dist / max(1.0, self.walk) + 3.0:
+                continue
+            if self.safe_point(obs, px, py, t + max(lands, 4.0)) >= 1:
+                continue
+            if any(hyp(kx, ky, px, py) < PARAMS["drop_clear_m"] for kx, ky in known):
+                continue
+            best, bd = (px, py), dist
+        return best
 
     def edge_time(self, zone: Dict[str, Any], x: float, y: float, t: float) -> float:
         """Time at which the shrinking zone edge passes the point (x, y); 1e9 if it never does
