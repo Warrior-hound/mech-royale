@@ -134,6 +134,10 @@ PARAMS = {
     # after a mech kill, loot its drop (all its cubes + 2, its weapons) for this long if nobody has LOS
     "corpse_s": 20.0,
     "econ_min_hp": 0.5,
+    # while fighting, walk to a better weapon within this range (keeps firing on the way)
+    "fight_arm_range": 70.0,
+    # econ trips under fire only when ttk_them >= econ_ttk_mult x the trip time
+    "econ_ttk_mult": 4.0,
     # give up on a loot goal that got no closer by 2 m in this many seconds (blocked climb, bad path)
     "econ_giveup_s": 8.0,
     # I3: keep a chosen movement mode at least this long unless a hard trigger fires
@@ -261,6 +265,7 @@ class Bot:
         self.cmode_state = None
         self.prev_los_ids: set = set()
         self.hp_hist: List[Tuple[float, float]] = []
+        self.last_dmg_anon_t = -99.0
         k_ie = PARAMS["inner_edge_phases"]
         self.inner_edge_t = starts[-k_ie] if len(starts) >= k_ie else 1e9
         # v4: recovery after a kill (position of the kill; cleared when healed and moved away)
@@ -415,6 +420,8 @@ class Bot:
                     self.last_hostile_t = t
                     if e.get("bearing") is not None:
                         self.dmg_bearing = e["bearing"]
+                    if e.get("by") is None:
+                        self.last_dmg_anon_t = t
                     if e.get("by") is not None:
                         self.attackers[int(e["by"])] = t
                         self.dmg_by = e["by"]
@@ -426,6 +433,8 @@ class Bot:
                 if isinstance(tg, int) and tg < 100:
                     self.focus_id, self.focus_t = tg, t
             elif et == "kill":
+                if isinstance(e.get("target"), int):
+                    self.attackers.pop(int(e["target"]), None)
                 if e.get("target") == self.focus_id:
                     self.focus_id = None
                 if isinstance(e.get("target"), int) and e["target"] < 100:  # mechs only, not drones
@@ -646,8 +655,17 @@ class Bot:
         # I1: economy goals come from the loot memory, whatever the mode branch, whenever nobody has
         # line of sight to us and we are not under fire
         econ = None
-        if not fighting and chase is None and not out_now and not shooters and not engaged                 and hp >= PARAMS["econ_min_hp"] * mhp and t < self.T["final_center_t"]:
+        # under fire = damage in the last 4 s from a mech that is still alive (a kill ends that fight)
+        under_fire = (t - self.last_dmg_anon_t) < 4.0 or any(t - ta < 4.0 for ta in self.attackers.values())
+        econ_hp = hp >= PARAMS["econ_min_hp"] * mhp or (self.corpse is not None and hp >= PARAMS["retreat_hp"] * mhp)
+        if not fighting and chase is None and not out_now and econ_hp and t < self.T["final_center_t"]:
             econ = self.econ_goal(obs, me, x, y, z, t, act, urgent and zdist > 8)
+            # with shooters on us, take the trip only when they need several times longer to kill us
+            # than the trip takes (a far gunner landing few hits)
+            if econ is not None and (shooters or under_fire):
+                trip = hyp(x, y, *econ[0]) / max(1.0, self.walk) + 2.0
+                if ttk_them < PARAMS["econ_ttk_mult"] * trip:
+                    econ = None
         if out_now or (urgent and zdist > 8):
             goal = (zgx, zgy)
             speed = 1.0
@@ -661,6 +679,12 @@ class Bot:
             goal = None  # hold position; lateral jinks below make us hard to lead
             mode = "fight"
             speed = 1.0
+            # I1: a better weapon close by is worth walking to while we keep shooting (fire control is
+            # independent of movement): gun -> gun+laser is x2.2 sustained DPS
+            if not out_now and not urgent:
+                fa = self.econ_goal(obs, me, x, y, z, t, act, False, wmax=PARAMS["fight_arm_range"], weapons_only=True)
+                if fa is not None:
+                    goal, mode = fa[0], "fight-arm"
             # with lightning ready, close to ~0.7 x its range (replay: lightning hits p50 31 m of 45)
             if "lightning" in my_kinds and me.get("energy", 0) > 30:
                 tx_, ty_ = target["pos"][0], target["pos"][1]
@@ -840,7 +864,8 @@ class Bot:
             # I1: a 360 deg torso sweep at spawn (and while unarmed with nothing remembered) fills the
             # loot memory: the far vision cone is only 120 deg
             w1 = weapons[1] if len(weapons) > 1 else None
-            if t < self.arm_t and (w1 is None or w1.get("kind") == "mortar") and mode.split("+")[0] != "arm"                     and t - self.sweep_last > 10.0 and not shooters and not engaged:
+            if t < self.arm_t and (w1 is None or w1.get("kind") == "mortar") and mode.split("+")[0] != "arm" \
+                    and t - self.sweep_last > 10.0 and not shooters and not engaged:
                 self.sweep_last, self.sweep_until = t, t + 2.0
             if t < self.sweep_until and not shooters and not engaged:
                 aim = [wrap((me.get("aim") or self.last_aim)[0] + 1.2), 0.0]
@@ -1123,7 +1148,8 @@ class Bot:
     def known_mechs(self, t: float, me_id) -> List[Tuple[float, float]]:
         return [(v[0], v[1]) for k, v in self.mech_last.items() if t - v[3] < 10.0 and k != me_id]
 
-    def econ_goal(self, obs, me, x, y, z, t, act, urgent: bool) -> Optional[Tuple[Tuple[float, float], str]]:
+    def econ_goal(self, obs, me, x, y, z, t, act, urgent: bool, wmax: Optional[float] = None,
+                  weapons_only: bool = False) -> Optional[Tuple[Tuple[float, float], str]]:
         """I1: the best remembered economy goal (second weapon, cubes, the last kill's drop), or None.
         Also issues `take` when a better weapon is within reach."""
         W = self.world
@@ -1136,6 +1162,8 @@ class Bot:
         energy = me.get("energy", 0.0) or 0.0
         best, bc, label = None, 1e9, None
         wrange = PARAMS["arm_range"] if t < self.arm_t else PARAMS["arm_late_range"]
+        if wmax is not None:
+            wrange = wmax
         for pid, (kind, pos, ts) in list(self.mem_pick.items()):
             if kind in held or kind == "gun" or kind is None:
                 continue
@@ -1166,7 +1194,7 @@ class Bot:
                 best, bc, label = (px, py), c, ("p", pid)
         # cubes (kill drops, crates, drones): remembered set within cube_range in the safe zone
         crange = PARAMS["cube_range"]
-        for cid, (pos, ts) in self.mem_cube.items():
+        for cid, (pos, ts) in ([] if weapons_only else self.mem_cube.items()):
             px, py, pz = pos
             if abs(pz - z) > 4 or self.econ_black.get(("q", cid), -99) > t:
                 continue
@@ -1178,7 +1206,7 @@ class Bot:
             c = d * (0.7 if want_w else 1.0)
             if c < bc:
                 best, bc, label = (px, py), c, ("q", cid)
-        if best is None and self.corpse is not None:
+        if best is None and self.corpse is not None and not weapons_only:
             px, py, pz, _ = self.corpse
             if self.safe_point(obs, px, py, t) < 1 and self.econ_black.get(("k", self.corpse[3]), -99) <= t:
                 best, label = (px, py), ("k", self.corpse[3])
