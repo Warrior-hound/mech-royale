@@ -151,6 +151,16 @@ PARAMS = {
     # I3: keep a chosen movement mode at least this long unless a hard trigger fires
     "mode_commit_s": 1.5,
     "dmg_spike_frac": 0.15,
+    # p-laser (from p-fight I2): laser vs a target holding neither laser nor lightning keeps
+    # kite_min..kite_max m (laser 280 m hitscan; house guns hit 0.90 at 30-60 m, 0.26 at 90-120 m,
+    # 0.12 past 160 m); the upper end is capped below vision range so we keep seeing it. While no held
+    # weapon can fire (laser cooling, gun reloading) we duck behind a prism within duck_radius m and
+    # return to the firing spot once loaded. The plan is kept fight_commit_s unless the target changes.
+    "fight_commit_s": 1.5,
+    "kite_min": 150.0,
+    "kite_max": 220.0,
+    "kite_boost_e": 40.0,
+    "duck_radius": 20.0,
 }
 # v2: lightning first. Measured on the public replay: the winner went gun+lightning (3,000 dmg on
 # 33 lightning hits at 16-43 m); lightning also beats laser in the triangle (short cancels charge).
@@ -325,6 +335,10 @@ class Bot:
         self.slow_ticks = 0
         self.tick_t0 = 0.0
         self.cover_budget_s = 0.005
+        # p-laser: the committed laser kite plan {tid, until, last, duck, duck_t, fire_pos}
+        self.fp: Optional[Dict[str, Any]] = None
+        self.want_reload = False
+        self.vision_range = (cfg.get("vision") or {}).get("range", 200.0)
         # v3: focus fire. The mech we damaged last and when; we finish it instead of letting it regen.
         self.focus_id: Optional[int] = None
         self.focus_t = -99.0
@@ -661,7 +675,18 @@ class Bot:
                     if fr < hp / mhp and hyp(x, y, m["pos"][0], m["pos"][1]) < PARAMS["chase_range"]:
                         chase = m
                     break
-        hide_needed = (not fighting) and (chase is None) and (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < 200)
+        # p-laser: a laser kite plan survives losing sight of its target while we duck
+        peek_m = None
+        fp = self.fp
+        if not fighting and target is None and chase is None and fp is not None and t - fp["last"] < 4.0 \
+                and not no_optional and not out_now and hp >= PARAMS["retreat_hp"] * mhp and not self.ffa:
+            for m in enemies:
+                if int(m["id"]) == fp["tid"]:
+                    peek_m = m
+                    break
+        if fp is not None and not fighting and peek_m is None:
+            self.fp = None
+        hide_needed = (not fighting) and (chase is None) and (peek_m is None) and (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < 200)
                                           or (hp < mhp * 0.98 and recent_hostile))
         if W and threats and hide_needed and elapsed < 6:
             if t - self.cover_t > 0.5 or self.cover is None:
@@ -700,10 +725,17 @@ class Bot:
             if hide_needed and self.cover is not None and self.safe_point(obs, *self.cover, t) < 1 and not out_now:
                 goal = self.cover
                 mode = "zone-cover"
-        elif fighting:
+        elif fighting or peek_m is not None:
             goal = None  # hold position; lateral jinks below make us hard to lead
             mode = "fight"
             speed = 1.0
+            lp = self.laser_plan(obs, me, target if fighting else peek_m, my_kinds, x, y, z, t, visible=fighting)
+            if lp is not None:
+                goal, mode = lp
+                if (mode.endswith("-out") or mode in ("fight-duck", "fight-return", "fight-back")) and \
+                        me.get("energy", 0) > PARAMS["kite_boost_e"] and \
+                        not any(wp and (wp.get("charge") or 0) > 0 for wp in (me.get("weapons") or [])):
+                    boost = True  # open the range fast (19.5 vs 11.7 m/s); not while a laser charges
             # I1: a better weapon close by is worth walking to while we keep shooting (fire control is
             # independent of movement): gun -> gun+laser is x2.2 sustained DPS
             if not out_now and not urgent:
@@ -711,7 +743,7 @@ class Bot:
                 if fa is not None:
                     goal, mode = fa[0], "fight-arm"
             # with lightning ready, close to ~0.7 x its range (replay: lightning hits p50 31 m of 45)
-            if "lightning" in my_kinds and me.get("energy", 0) > 30:
+            if fighting and "lightning" in my_kinds and me.get("energy", 0) > 30:
                 tx_, ty_ = target["pos"][0], target["pos"][1]
                 dtg = hyp(x, y, tx_, ty_)
                 if dtg > 0.7 * self.light_range:
@@ -793,12 +825,17 @@ class Bot:
         hard = out_now or mode == "zone" or spike or new_los or (low and not getattr(self, "low_prev", False))
         self.low_prev = low
         if mode != self.cmode:
-            if (not hard and self.cmode is not None and self.cmode_state is not None
+            # fight sub-modes (kite / duck / return) belong to one committed fight plan
+            same_fight = mode.startswith("fight") and (self.cmode or "").startswith("fight")
+            if (not hard and not same_fight and self.cmode is not None and self.cmode_state is not None
                     and t - self.cmode_t < PARAMS["mode_commit_s"]):
                 mode, goal, speed, boost = self.cmode_state
             else:
                 self.cmode, self.cmode_t = mode, t
         self.cmode_state = (mode, goal, speed, boost)
+        if self.want_reload:
+            act["reload"] = True
+            self.want_reload = False
 
         mv = [0.0, 0.0]
         gdir = None  # v5: unit direction toward the movement goal (None = holding position)
@@ -881,6 +918,8 @@ class Bot:
                 mode += "+farm"  # I3: the label is the movement mode; fire targets are a suffix
         if target is None and chase is not None:
             aim, _ = self.fire_control(me, chase, weapons, x, y, z, muz_h)  # pre-aim, no blind fire
+        elif target is None and peek_m is not None:
+            aim, _ = self.fire_control(me, peek_m, weapons, x, y, z, muz_h)  # ducked: pre-aim at the edge
         elif target is not None:
             aim, fire = self.fire_control(me, target, weapons, x, y, z, muz_h)
             if PARAMS["pacifist"] and target.get("kind") == "mech":
@@ -921,6 +960,112 @@ class Bot:
         self.mode = mode
         mf.draw.label(f"{'F' if self.ffa else 'S'} {mode} hp{hp:.0f} e{len(enemies)} {self.gate_info}")
         return act
+
+    # ------------------------------------------------------------------ p-laser kite plan
+    def laser_plan(self, obs, me, m, my_kinds, x, y, z, t, visible=True):
+        """Movement for a laser fight against a target holding neither laser nor lightning, or None
+        (then the default fight movement applies). Holds the kite band; while none of our weapons can
+        fire, steps behind the nearest prism that breaks the target's sight (else backs off) and
+        returns to the last firing spot once loaded."""
+        tid = int(m["id"])
+        tx, ty, tz = m["pos"]
+        d = hyp(x, y, tx, ty)
+        fp = self.fp
+        if fp is None or fp["tid"] != tid or t >= fp["until"]:
+            their = [k if isinstance(k, str) else (k or {}).get("kind") for k in (m.get("weapons") or ["gun"])]
+            if not ("laser" in my_kinds and "laser" not in their and "lightning" not in their):
+                self.fp = None
+                return None
+            keep = fp if (fp is not None and fp["tid"] == tid) else {}
+            fp = self.fp = {"tid": tid, "until": t + PARAMS["fight_commit_s"], "last": t,
+                            "duck": keep.get("duck"), "duck_t": keep.get("duck_t", -99.0),
+                            "fire_pos": keep.get("fire_pos")}
+        if visible:
+            fp["last"] = t
+        finishing = m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0)) <= PARAMS["finish_frac"]
+        if not self.weapon_ready(me) and not finishing:
+            # duck: nothing to shoot with, so every hit taken now is pure loss
+            g0 = (me.get("weapons") or [None])[0]
+            if not visible and g0 and g0.get("kind") == "gun" and not g0.get("reload") and \
+                    g0.get("ammo", 12) < g0.get("stats", {}).get("mag", 12):
+                self.want_reload = True  # tactical reload once out of sight
+            if self.world is not None and (fp["duck"] is None or t - fp["duck_t"] > 1.0):
+                fp["duck"], fp["duck_t"] = self.find_duck(obs, x, y, z, tx, ty, tz, t), t
+            if fp["duck"] is not None:
+                return fp["duck"], "fight-duck"
+            b = math.atan2(y - ty, x - tx)
+            return (x + 20.0 * math.cos(b), y + 20.0 * math.sin(b)), "fight-back"
+        fp["duck"] = None
+        if visible:
+            fp["fire_pos"] = (x, y)
+        elif fp["fire_pos"] is not None:
+            if hyp(x, y, *fp["fire_pos"]) < 2.5:
+                self.fp = None  # back at the firing spot and still no line of sight: the plan is stale
+                return None
+            return fp["fire_pos"], "fight-return"
+        return self.standoff(obs, x, y, tx, ty, d, t, "fight-kite")
+
+    def weapon_ready(self, me) -> bool:
+        """True if some held weapon can fire within ~0.4 s."""
+        for w in me.get("weapons") or []:
+            if not w:
+                continue
+            k = w.get("kind")
+            if k == "gun" and not w.get("reload") and w.get("ammo", 12) > 0:
+                return True
+            if k == "laser" and ((w.get("charge") or 0) > 0 or w.get("cooldown", 0) <= 0.4):
+                return True
+            if k == "lightning" and me.get("energy", 0) > 8:
+                return True
+            if k == "mortar" and w.get("cooldown", 0) <= 0.4:
+                return True
+        return False
+
+    def standoff(self, obs, x, y, tx, ty, d, t, tag):
+        """Goal keeping the target at kite_min..kite_max m (upper end below vision range)."""
+        kmin = PARAMS["kite_min"]
+        kmax = max(kmin + 10.0, min(PARAMS["kite_max"], self.vision_range - 5.0))
+        if d > kmax:
+            f_ = (d - 0.5 * (kmin + kmax)) / d
+            return (x + (tx - x) * f_, y + (ty - y) * f_), tag + "-in"
+        if d < kmin:
+            b = math.atan2(y - ty, x - tx)
+            W = self.world
+            for off in (0.0, 0.5, -0.5, 1.0, -1.0):
+                px, py = x + 25.0 * math.cos(b + off), y + 25.0 * math.sin(b + off)
+                if W is not None and not (W.walkable(px, py) and W.line_clear(x, y, px, py)):
+                    continue
+                if self.safe_point(obs, px, py, t) >= 1:
+                    continue
+                return (px, py), tag + "-out"
+        return None, tag
+
+    def find_duck(self, obs, x, y, z, tx, ty, tz, t) -> Optional[Tuple[float, float]]:
+        """Nearest straight-walkable spot on our level within duck_radius m where buildings (prisms;
+        trees stop neither bullets nor the 5 s memory) hide our whole body from the target's eye."""
+        W = self.world
+        eye = (tx, ty, tz + 8.0)
+        b = math.atan2(y - ty, x - tx)
+        rr = PARAMS["duck_radius"]
+        cands = []
+        for f in (0.2, 0.4, 0.6, 0.8, 1.0):
+            for k in range(16):
+                a = b + k * TAU / 16
+                cands.append((x + rr * f * math.cos(a), y + rr * f * math.sin(a)))
+        cands.sort(key=lambda p: hyp(x, y, p[0], p[1]))
+        deadline = self.tick_t0 + self.cover_budget_s
+        for (px, py) in cands:
+            if time.perf_counter() > deadline:
+                return None
+            if not W.walkable(px, py) or not W.line_clear(x, y, px, py):
+                continue
+            gz = W.floor[W.idx(px, py)]
+            if abs(gz - z) > W.rise or self.safe_point(obs, px, py, t) >= 1:
+                continue
+            if W.sight_blocked(eye, (px, py, gz + 4.5)) and W.sight_blocked(eye, (px, py, gz + 9.0)) and \
+                    W.sight_blocked(eye, (px, py, gz + 1.0)):
+                return (px, py)
+        return None
 
     # ------------------------------------------------------------------ v2 models
     def gun_hit_p(self, d: float, miss_h: float, miss_v: float, tt: float, spread: Optional[float] = None,
