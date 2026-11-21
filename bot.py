@@ -157,8 +157,7 @@ PARAMS = {
     "kite_min": 150.0,
     "kite_max": 220.0,
     "kite_boost_e": 40.0,
-    "peek_radius": 36.0,
-    "peek_duck_m": 5.0,
+    "duck_radius": 20.0,
     "light_weak_frac": 0.5,
     "light_weak_ratio": 0.6,
 }
@@ -336,6 +335,7 @@ class Bot:
         self.cover_budget_s = 0.005
         # v5.3 I2: the committed fight plan {kind, tid, until, peek, hide, tpos, last}
         self.fp: Optional[Dict[str, Any]] = None
+        self.want_reload = False
         self.vision_range = (cfg.get("vision") or {}).get("range", 200.0)
         # v3: focus fire. The mech we damaged last and when; we finish it instead of letting it regen.
         self.focus_id: Optional[int] = None
@@ -668,7 +668,7 @@ class Bot:
         # v5.3 I2: a peek plan survives losing sight of its target while we duck to reload
         peek_m = None
         fp = self.fp
-        if not fighting and chase is None and fp is not None and fp["kind"] == "peek" and t - fp["last"] < 4.0 \
+        if not fighting and target is None and chase is None and fp is not None and fp["kind"] != "light" and t - fp["last"] < 4.0 \
                 and not no_optional and not out_now and hp >= PARAMS["retreat_hp"] * mhp and not self.ffa:
             for m in enemies:
                 if int(m["id"]) == fp["tid"]:
@@ -711,7 +711,7 @@ class Bot:
             speed = 1.0
             goal, mode = self.fight_plan(obs, me, target if fighting else peek_m, my_kinds, x, y, z, hp, t,
                                          visible=fighting)
-            if mode.endswith("-out") and me.get("energy", 0) > PARAMS["kite_boost_e"] and                     not any(wp and (wp.get("charge") or 0) > 0 for wp in (me.get("weapons") or [])):
+            if (mode.endswith("-out") or mode in ("fight-duck", "fight-return", "fight-back")) and                     me.get("energy", 0) > PARAMS["kite_boost_e"] and                     not any(wp and (wp.get("charge") or 0) > 0 for wp in (me.get("weapons") or [])):
                 boost = True  # open the range fast (19.5 vs 11.7 m/s); not while a laser charges
             # I1: a better weapon close by is worth walking to while we keep shooting (fire control is
             # independent of movement): gun -> gun+laser is x2.2 sustained DPS
@@ -788,13 +788,18 @@ class Bot:
         self.prev_los_ids = los_ids
         hard = out_now or mode == "zone" or spike or new_los or hp < PARAMS["retreat_hp"] * mhp
         if mode != self.cmode:
-            if (not hard and self.cmode is not None and self.cmode_state is not None
+            # I2 fight sub-modes (duck / return / kite) belong to one committed fight plan
+            same_fight = mode.startswith("fight") and (self.cmode or "").startswith("fight")
+            if (not hard and not same_fight and self.cmode is not None and self.cmode_state is not None
                     and t - self.cmode_t < PARAMS["mode_commit_s"]):
                 mode, goal, speed, boost = self.cmode_state
             else:
                 self.cmode, self.cmode_t = mode, t
         self.cmode_state = (mode, goal, speed, boost)
 
+        if self.want_reload:
+            act["reload"] = True
+            self.want_reload = False
         mv = [0.0, 0.0]
         gdir = None  # v5: unit direction toward the movement goal (None = holding position)
         if goal is not None:
@@ -921,7 +926,12 @@ class Bot:
 
     # ------------------------------------------------------------------ v5.3 I2 fight plan
     def fight_plan(self, obs, me, m, my_kinds, x, y, z, hp, t, visible=True):
-        """Movement goal for a mech fight, chosen by matchup and committed for fight_commit_s."""
+        """Movement goal for a mech fight (kiter, research card 2/3). The matchup plan is committed for
+        fight_commit_s: lightning closes in on a weak target or a laser holder; a laser against a
+        target without one holds the kite band; otherwise hold. Whatever the plan, while none of our
+        weapons can fire (gun reloading, laser cooling, lightning empty) we step behind the nearest
+        building that breaks the target's line of sight (else back off), and return to the last
+        firing spot once loaded."""
         tid = int(m["id"])
         tx, ty, tz = m["pos"]
         d = hyp(x, y, tx, ty)
@@ -934,18 +944,14 @@ class Bot:
             if "lightning" in my_kinds and me.get("energy", 0) > 30 and \
                     (weak or ("laser" in their and "lightning" not in their)):
                 kind = "light"
-            elif "laser" in my_kinds and "laser" not in their:
+            elif "laser" in my_kinds and "laser" not in their and "lightning" not in their:
                 kind = "kite"
             else:
-                kind = "peek"
-            old = fp if (fp is not None and fp["tid"] == tid and fp["kind"] == kind) else None
-            fp = self.fp = {"kind": kind, "tid": tid, "until": t + PARAMS["fight_commit_s"], "peek": None,
-                            "hide": None, "tpos": (tx, ty), "last": t}
-            if kind == "peek" and self.world is not None:
-                if old is not None and old["peek"] is not None and hyp(tx, ty, *old["tpos"]) < 10.0:
-                    fp["peek"], fp["hide"], fp["tpos"] = old["peek"], old["hide"], old["tpos"]
-                else:
-                    self.find_peek(obs, fp, x, y, z, tx, ty, tz, t)
+                kind = "hold"
+            keep = fp if (fp is not None and fp["tid"] == tid) else {}
+            fp = self.fp = {"kind": kind, "tid": tid, "until": t + PARAMS["fight_commit_s"], "last": t,
+                            "duck": keep.get("duck"), "duck_t": keep.get("duck_t", -99.0),
+                            "fire_pos": keep.get("fire_pos")}
         if visible:
             fp["last"] = t
         kind = fp["kind"]
@@ -955,76 +961,92 @@ class Bot:
                 f_ = (d - 0.6 * self.light_range) / d
                 return (x + (tx - x) * f_, y + (ty - y) * f_), "fight-close"
             return None, "fight"
+        finishing = m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0)) <= PARAMS["finish_frac"]
+        if not self.weapon_ready(me) and not finishing:
+            # duck: nothing to shoot with, so every hit taken now is pure loss
+            g0 = (me.get("weapons") or [None])[0]
+            if not visible and g0 and g0.get("kind") == "gun" and not g0.get("reload") and \
+                    g0.get("ammo", 12) < g0.get("stats", {}).get("mag", 12):
+                self.want_reload = True  # tactical reload once out of sight
+            if self.world is not None and (fp["duck"] is None or t - fp["duck_t"] > 1.0):
+                fp["duck"], fp["duck_t"] = self.find_duck(obs, x, y, z, tx, ty, tz, t), t
+            if fp["duck"] is not None:
+                return fp["duck"], "fight-duck"
+            b = math.atan2(y - ty, x - tx)
+            return (x + 20.0 * math.cos(b), y + 20.0 * math.sin(b)), "fight-back"
+        fp["duck"] = None
+        if visible:
+            fp["fire_pos"] = (x, y)
+        elif fp["fire_pos"] is not None:
+            if hyp(x, y, *fp["fire_pos"]) < 2.5:
+                self.fp = None  # back at the firing spot and still no line of sight: the plan is stale
+                return None, "fight"
+            return fp["fire_pos"], "fight-return"
         if kind == "kite":
             return self.standoff(obs, x, y, tx, ty, d, t, "fight-kite")
-        # peek: shoot from the edge while the gun has rounds, duck behind it while reloading
-        g0 = (me.get("weapons") or [None])[0]
-        ready = not (g0 and g0.get("kind") == "gun" and (g0.get("reload") or g0.get("ammo", 12) == 0))
-        if fp["peek"] is None:
-            # no cover edge in reach: an equal-range gun duel favours the side further out (our jink
-            # beats a lead over a longer flight time), so open the range like a kite
-            return self.standoff(obs, x, y, tx, ty, d, t, "fight-standoff")
-        if ready:
-            return fp["peek"], "fight-peek"
-        return fp["hide"], "fight-duck"
+        return None, "fight"
+
+    def weapon_ready(self, me) -> bool:
+        """True if some held weapon can fire within ~0.4 s."""
+        for w in me.get("weapons") or []:
+            if not w:
+                continue
+            k = w.get("kind")
+            if k == "gun" and not w.get("reload") and w.get("ammo", 12) > 0:
+                return True
+            if k == "laser" and ((w.get("charge") or 0) > 0 or w.get("cooldown", 0) <= 0.4):
+                return True
+            if k == "lightning" and me.get("energy", 0) > 8:
+                return True
+            if k == "mortar" and w.get("cooldown", 0) <= 0.4:
+                return True
+        return False
 
     def standoff(self, obs, x, y, tx, ty, d, t, tag):
         """Goal keeping the target at kite_min..kite_max m (upper end below vision range)."""
-        if True:
-            kmin = PARAMS["kite_min"]
-            kmax = max(kmin + 10.0, min(PARAMS["kite_max"], self.vision_range - 5.0))
-            if d > kmax:
-                f_ = (d - 0.5 * (kmin + kmax)) / d
-                return (x + (tx - x) * f_, y + (ty - y) * f_), tag + "-in"
-            if d < kmin:
-                b = math.atan2(y - ty, x - tx)
-                W = self.world
-                for off in (0.0, 0.5, -0.5, 1.0, -1.0):
-                    px, py = x + 25.0 * math.cos(b + off), y + 25.0 * math.sin(b + off)
-                    if W is not None and not (W.walkable(px, py) and W.line_clear(x, y, px, py)):
-                        continue
-                    if self.safe_point(obs, px, py, t) >= 1:
-                        continue
-                    return (px, py), tag + "-out"
-            return None, tag
+        kmin = PARAMS["kite_min"]
+        kmax = max(kmin + 10.0, min(PARAMS["kite_max"], self.vision_range - 5.0))
+        if d > kmax:
+            f_ = (d - 0.5 * (kmin + kmax)) / d
+            return (x + (tx - x) * f_, y + (ty - y) * f_), tag + "-in"
+        if d < kmin:
+            b = math.atan2(y - ty, x - tx)
+            W = self.world
+            for off in (0.0, 0.5, -0.5, 1.0, -1.0):
+                px, py = x + 25.0 * math.cos(b + off), y + 25.0 * math.sin(b + off)
+                if W is not None and not (W.walkable(px, py) and W.line_clear(x, y, px, py)):
+                    continue
+                if self.safe_point(obs, px, py, t) >= 1:
+                    continue
+                return (px, py), tag + "-out"
+        return None, tag
 
-    def find_peek(self, obs, fp, x, y, z, tx, ty, tz, t) -> None:
-        """Nearest cover edge: a walkable spot on our level from which we can shoot the target, with a
-        spot peek_duck_m away (sideways or back) hidden from the target's eye."""
+    def find_duck(self, obs, x, y, z, tx, ty, tz, t) -> Optional[Tuple[float, float]]:
+        """Nearest straight-walkable spot on our level within duck_radius m where buildings (prisms;
+        trees stop neither bullets nor the 5 s memory) hide our whole body from the target's eye."""
         W = self.world
         eye = (tx, ty, tz + 8.0)
-        b = math.atan2(ty - y, tx - x)
-        rr = PARAMS["peek_radius"]
-        cands = [(x, y)]
-        for f in (0.25, 0.5, 0.75, 1.0):
+        b = math.atan2(y - ty, x - tx)
+        rr = PARAMS["duck_radius"]
+        cands = []
+        for f in (0.2, 0.4, 0.6, 0.8, 1.0):
             for k in range(16):
                 a = b + k * TAU / 16
                 cands.append((x + rr * f * math.cos(a), y + rr * f * math.sin(a)))
         cands.sort(key=lambda p: hyp(x, y, p[0], p[1]))
-        dm = PARAMS["peek_duck_m"]
         deadline = self.tick_t0 + self.cover_budget_s
         for (px, py) in cands:
             if time.perf_counter() > deadline:
-                return
-            if not W.walkable(px, py) or self.safe_point(obs, px, py, t) >= 1:
+                return None
+            if not W.walkable(px, py) or not W.line_clear(x, y, px, py):
                 continue
             gz = W.floor[W.idx(px, py)]
-            if abs(gz - z) > W.rise or (hyp(x, y, px, py) > 1 and not W.line_clear(x, y, px, py)):
+            if abs(gz - z) > W.rise or self.safe_point(obs, px, py, t) >= 1:
                 continue
-            if W.sight_blocked((px, py, gz + 7.0), (tx, ty, tz + 4.0)):
-                continue  # we could not shoot from here
-            bp = math.atan2(ty - py, tx - px)
-            for (ox, oy) in ((-math.sin(bp), math.cos(bp)), (math.sin(bp), -math.cos(bp)),
-                             (-math.cos(bp), -math.sin(bp))):
-                qx, qy = px + dm * ox, py + dm * oy
-                if not W.walkable(qx, qy) or not W.line_clear(px, py, qx, qy):
-                    continue
-                gq = W.floor[W.idx(qx, qy)]
-                if abs(gq - gz) > W.rise:
-                    continue
-                if W.sight_blocked(eye, (qx, qy, gq + 4.5)) and W.sight_blocked(eye, (qx, qy, gq + 9.0)):
-                    fp["peek"], fp["hide"] = (px, py), (qx, qy)
-                    return
+            if W.sight_blocked(eye, (px, py, gz + 4.5)) and W.sight_blocked(eye, (px, py, gz + 9.0)) and \
+                    W.sight_blocked(eye, (px, py, gz + 1.0)):
+                return (px, py)
+        return None
 
     # ------------------------------------------------------------------ v2 models
     def gun_hit_p(self, d: float, miss_h: float, miss_v: float, tt: float, spread: Optional[float] = None,
