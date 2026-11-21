@@ -86,6 +86,10 @@ PARAMS = {
     "ffa_ev_needed": 1,
     # evidence before ffa_min_t s is ignored (cuts squad false switches; FFA replays: 75% still detected by 20 s)
     "ffa_min_t": 8.0,
+    # v5.2 card 1, minimum-risk cover: score -= risk_k * energy * (50/d)^2 per unseen-by-LOS threat,
+    # x risk_closest_mult where the point is closer to that mech than any other known mech.
+    "risk_k": 4.0,
+    "risk_closest_mult": 2.0,
     # v5 loot: a pickup more than loot_roof_dz above the terrain under it is on a roof; before
     # loot_early_t (first hunters arrive) weapon pickups are sought up to loot_early_range.
     "loot_roof_dz": 2.0,
@@ -434,15 +438,16 @@ class Bot:
             if dm < 230:
                 self.last_hostile_t = t
         enemies.sort(key=lambda m: hyp(x, y, m["pos"][0], m["pos"][1]))
-        threats: List[Tuple[float, float, float, float]] = []  # x, y, z, weight
-        for m in enemies[:4]:
-            threats.append((m["pos"][0], m["pos"][1], m["pos"][2], 2.0))
+        threats: List[Tuple[float, float, float, float, float]] = []  # x, y, z, weight, energy (HP/1400)
+        # v5.2 card 1: every known mech is a threat (min-risk positioning sums over all of them)
+        for m in enemies:
+            threats.append((m["pos"][0], m["pos"][1], m["pos"][2], 2.0, float(m.get("hp", 1400.0)) / 1400.0))
         for n in npcs[:3]:
             if hyp(x, y, n["pos"][0], n["pos"][1]) < 90:
-                threats.append((n["pos"][0], n["pos"][1], n["pos"][2], 0.7))
+                threats.append((n["pos"][0], n["pos"][1], n["pos"][2], 0.7, float(n.get("hp", 350.0)) / 1400.0))
         for (px, py, wgt, _) in self.pseudo[-4:]:
             gz = W.ground_at(px, py) if W else z
-            threats.append((px, py, gz, wgt))
+            threats.append((px, py, gz, wgt, 1.0))
 
         engaged = (t - self.last_damage_t) < 4.0
         recent_hostile = (t - self.last_hostile_t) < 12.0
@@ -651,7 +656,7 @@ class Bot:
                 if W and (self.cover is None or t - self.cover_t > 4.0) and elapsed < 6:
                     ncx, ncy = zone["next_center"]
                     b = math.atan2(ncy - y, ncx - x)
-                    pseudo = [(x + 120 * math.cos(b + k), y + 120 * math.sin(b + k), z, 0.5) for k in (-0.6, 0.0, 0.6)]
+                    pseudo = [(x + 120 * math.cos(b + k), y + 120 * math.sin(b + k), z, 0.5, 1.0) for k in (-0.6, 0.0, 0.6)]
                     self.choose_cover(obs, x, y, z, pseudo + threats, t, radius=24.0)
                 if self.cover is not None and self.safe_point(obs, *self.cover, t) < 1:
                     goal = self.cover
@@ -1051,6 +1056,11 @@ class Bot:
             for f in (0.25, 0.5, 0.75, 1.0):
                 cands.append((x + radius * f * math.cos(a), y + radius * f * math.sin(a)))
         ths = sorted(threats, key=lambda th: hyp(x, y, th[0], th[1]) / th[3])[:3]
+        # v5.2 card 1 (Robocode minimum-risk movement): risk = sum over all threats of energy / dist^2,
+        # x risk_closest_mult where the point would be that mech's closest target. LOS only for the top 3.
+        mpos = [(m["pos"][0], m["pos"][1]) for m in obs.get("mechs") or []
+                if m.get("kind") == "mech" and m.get("id") != (obs.get("self") or {}).get("id")]
+        rk, rc = PARAMS["risk_k"], PARAMS["risk_closest_mult"]
         deadline = self.tick_t0 + self.cover_budget_s
         for (px, py) in cands:
             if time.perf_counter() > deadline:
@@ -1067,17 +1077,28 @@ class Bot:
                 dme *= PARAMS["detour"]
             sc = -dme / 12.0 - self.safe_point(obs, px, py, t)
             can = W.canopy_at(px, py)
-            for (tx, ty, tz, wgt) in ths:
+            hid = set()
+            for th in ths:
+                tx, ty, tz, wgt = th[0], th[1], th[2], th[3]
                 dt = hyp(tx, ty, px, py)
                 eye = (tx, ty, tz + 8.0)
                 hidden = W.sight_blocked(eye, (px, py, gz + 9.0)) and W.sight_blocked(eye, (px, py, gz + 4.5))
                 if hidden:
                     sc += 6.0 * wgt
+                    hid.add(id(th))
                 elif dt > self.near_range and can >= 4.0:
                     sc += 4.0 * wgt
                 elif dt > 200:
                     sc += 2.0 * wgt
-                sc += min(dt, 220.0) / 40.0 * wgt
+            for th in threats:
+                if id(th) in hid:
+                    continue
+                tx, ty = th[0], th[1]
+                dt = hyp(tx, ty, px, py)
+                r = rk * 0.5 * th[3] * (th[4] if len(th) > 4 else 1.0) * (50.0 / max(dt, 15.0)) ** 2
+                if th[3] >= 2.0 and all(hyp(tx, ty, ox, oy) >= dt or hyp(tx, ty, ox, oy) < 1.0 for (ox, oy) in mpos):
+                    r *= rc  # we would be this mech's closest target
+                sc -= r
             if (px, py) == (x, y):
                 sc += 0.5
             if sc > bs:
