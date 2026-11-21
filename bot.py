@@ -102,6 +102,8 @@ PARAMS = {
     # its centre, on the side facing the hunters, so they approach through the zone edge.
     "inner_edge_frac": 0.6,
     "inner_edge_phases": 3,
+    # Probe P1: never fire at mechs (score = zone/NPC deaths + jackpot only). False in real play.
+    "pacifist": False,
 }
 # v2: lightning first. Measured on the public replay: the winner went gun+lightning (3,000 dmg on
 # 33 lightning hits at 16-43 m); lightning also beats laser in the triangle (short cancels charge).
@@ -359,7 +361,8 @@ class Bot:
             elif et == "kill":
                 if e.get("target") == self.focus_id:
                     self.focus_id = None
-                self.recover_from = (x, y)
+                if isinstance(e.get("target"), int) and e["target"] < 100:  # mechs only, not drones
+                    self.recover_from = (x, y)
             elif et == "take_failed":
                 self.taken_fail[int(e.get("id", -1))] = t
         for s in obs.get("sounds") or []:
@@ -488,6 +491,8 @@ class Bot:
                     ok = ok and n_hunters <= PARAMS["detail_max_hunters"] and not (survive and not attacker)
                 else:
                     ok = ok and (not no_optional) and m_hp <= PARAMS["detail_hp_ratio"] * hp
+                if PARAMS["pacifist"]:
+                    ok = False
             focus = is_mech and int(m["id"]) == self.focus_id and (t - self.focus_t) < 8.0
             if not is_mech:
                 # drones: when they shoot us, or (v3) to farm cubes while no mech is around
@@ -704,6 +709,8 @@ class Bot:
             aim, _ = self.fire_control(me, chase, weapons, x, y, z, muz_h)  # pre-aim, no blind fire
         elif target is not None:
             aim, fire = self.fire_control(me, target, weapons, x, y, z, muz_h)
+            if PARAMS["pacifist"] and target.get("kind") == "mech":
+                fire = [False, False]
             if mode in ("travel", "loot", "camp", "idle"):
                 mode = "fight"
         if aim is None:
