@@ -38,7 +38,7 @@ SQRT2 = math.sqrt(2.0)
 PARAMS = {
     # Fire discipline: minimum predicted hit probability per gun bullet. Lower = more DPS at long
     # range, but wasted ammo (reload 2.4 s) and a gun sound heard at 320 m for little damage.
-    "gun_min_hit_p": 0.12,
+    "gun_min_hit_p": 0.05,
     # Laser release threshold: a miss costs a full charge + cooldown (2.4 s), so it is stricter.
     "laser_min_hit_p": 0.60,
     # Assumed random acceleration (m/s^2) of a target during the bullet flight, for hit prediction.
@@ -73,10 +73,10 @@ PARAMS = {
     "cover_radius": 48.0,
     # Farm drones / crates for cubes when nothing hostile is near and HP is above this fraction
     # (replay winner farmed 16 cubes). Higher = safer, fewer cubes; firing is heard at 320 m.
-    "farm_min_hp": 0.6,
+    "farm_min_hp": 0.4,
     "farm_range": 60.0,
     # v3: actively walk to drones / crates seen within this distance while quiet (before endgame).
-    "farm_seek_range": 120.0,
+    "farm_seek_range": 200.0,
     # v4 card A, defeat in detail (Lanchester n^2: we beat one hunter, lose to two). Optional mech
     # fights only when <= detail_max_hunters known hunters are within detail_range and the target's
     # HP <= detail_hp_ratio x ours; any second hunter seen/heard within detail_abort_range aborts.
