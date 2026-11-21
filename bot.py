@@ -114,6 +114,31 @@ PARAMS = {
     "inner_edge_phases": 3,
     # Probe P1: never fire at mechs (score = zone/NPC deaths + jackpot only). False in real play.
     "pacifist": False,
+    # ---- p-econ (architecture review I1/I3/I4)
+    # The absolute times above (no_fight_t .. cluster_t) are tuned on the stream zone timeline
+    # (415 s total, first hold 60 s); at hello they are rescaled to the timeline the config gives.
+    "ref_timeline_s": 415.0,
+    "ref_first_hold_s": 60.0,
+    # Arm-up window as a multiple of the first hold (only one, weakest, hunter is out): head for the
+    # nearest remembered laser / lightning (mortar costs mortar_cost x its distance).
+    "arm_hold_mult": 1.5,
+    "arm_range": 350.0,
+    "arm_late_range": 150.0,
+    "mortar_cost": 2.5,
+    # extra metres charged for a roof pickup (jet climb, exposure); climbs above max_climb_frac of
+    # what a full tank lifts us (100 energy / 15 per s x 8.9 m/s ~ 59 m) are skipped
+    "roof_cost_m": 25.0,
+    "max_climb_frac": 0.7,
+    # remembered cubes are walked to within this range (v5.1: 60 m and only while visible)
+    "cube_range": 150.0,
+    # after a mech kill, loot its drop (all its cubes + 2, its weapons) for this long if nobody has LOS
+    "corpse_s": 20.0,
+    "econ_min_hp": 0.5,
+    # give up on a loot goal that got no closer by 2 m in this many seconds (blocked climb, bad path)
+    "econ_giveup_s": 8.0,
+    # I3: keep a chosen movement mode at least this long unless a hard trigger fires
+    "mode_commit_s": 1.5,
+    "dmg_spike_frac": 0.15,
 }
 # v2: lightning first. Measured on the public replay: the winner went gun+lightning (3,000 dmg on
 # 33 lightning hits at 16-43 m); lightning also beats laser in the triangle (short cancels charge).
@@ -206,6 +231,36 @@ class Bot:
             starts.append(tt)
             tt += ph.get("hold_s", 0) + ph.get("shrink_s", 0)
         self.endgame_t = starts[-2] if len(starts) >= 2 else 1e9
+        # I4: absolute-time PARAMS rescaled to this config's zone timeline (identical on the stream config)
+        sc_t = tt / PARAMS["ref_timeline_s"] if tt > 0 else 1.0
+        hold0 = zph[0].get("hold_s", PARAMS["ref_first_hold_s"]) if zph else PARAMS["ref_first_hold_s"]
+        sc_h = hold0 / PARAMS["ref_first_hold_s"]
+        self.T = {k: PARAMS[k] * sc_t for k in ("no_fight_t", "final_center_t", "survive_t", "cluster_t")}
+        self.T["loot_early_t"] = PARAMS["loot_early_t"] * sc_h
+        self.arm_t = PARAMS["arm_hold_mult"] * hold0
+        # I1: world memory of loot. pickups id -> (kind, (x, y, z), t_seen); crates / cubes id -> (pos, t)
+        self.mem_pick: Dict[int, Tuple[Any, Tuple[float, float, float], float]] = {}
+        self.mem_crate: Dict[int, Tuple[Tuple[float, float, float], float]] = {}
+        self.mem_cube: Dict[int, Tuple[Tuple[float, float, float], float]] = {}
+        self.mech_last: Dict[int, Tuple[float, float, float, float]] = {}  # id -> x, y, z, t
+        self.corpse: Optional[Tuple[float, float, float, float]] = None
+        self.econ_key = None
+        self.econ_best = (1e9, 0.0)
+        self.econ_black: Dict[Any, float] = {}
+        self.sweep_until = -1.0
+        self.sweep_last = -99.0
+        self.mem_check_i = 0
+        vis = cfg.get("vision") or {}
+        self.vis_range = vis.get("range", 200.0)
+        self.fov_half = math.radians(vis.get("fov_deg", 120.0)) / 2
+        self.max_climb = PARAMS["max_climb_frac"] * mech.get("energy", 100.0) / max(1e-3, mech.get("jet_drain", 15.0)) * \
+            (mech.get("max_rise_speed", 10.0) - mech.get("gravity", 22.0) * self.tick_dt)
+        # I3: committed movement mode
+        self.cmode: Optional[str] = None
+        self.cmode_t = -99.0
+        self.cmode_state = None
+        self.prev_los_ids: set = set()
+        self.hp_hist: List[Tuple[float, float]] = []
         k_ie = PARAMS["inner_edge_phases"]
         self.inner_edge_t = starts[-k_ie] if len(starts) >= k_ie else 1e9
         # v4: recovery after a kill (position of the kill; cleared when healed and moved away)
@@ -317,7 +372,7 @@ class Bot:
         ncx, ncy = z["next_center"]
         nr = z["next_radius"]
         inset = max(0.0, nr - min(30.0, 0.35 * nr + 3.0))
-        if obs.get("t", 0) >= min(self.endgame_t, PARAMS["final_center_t"]):
+        if obs.get("t", 0) >= min(self.endgame_t, self.T["final_center_t"]):
             inset = 0.0  # HP race: the circle centre stays inside longest during the last shrinks
         d = hyp(ncx, ncy, x, y)
         if d <= inset:
@@ -375,8 +430,18 @@ class Bot:
                     self.focus_id = None
                 if isinstance(e.get("target"), int) and e["target"] < 100:  # mechs only, not drones
                     self.recover_from = (x, y)
+                    ml = self.mech_last.get(int(e["target"]))
+                    if ml is not None and t - ml[3] < 3.0:
+                        self.corpse = (ml[0], ml[1], ml[2], t)
+                if isinstance(e.get("target"), int):
+                    self.mem_crate.pop(int(e["target"]), None)
             elif et == "take_failed":
                 self.taken_fail[int(e.get("id", -1))] = t
+                if e.get("reason") == "gone":
+                    self.mem_pick.pop(int(e.get("id", -1)), None)
+            elif et == "took":
+                self.mem_pick.pop(int(e.get("id", -1)), None)
+        self.update_memory(obs, me, x, y, z, eye_h, t)
         for s in obs.get("sounds") or []:
             if s.get("kind") in HOSTILE_SOUNDS and s.get("age", 0) < 1.0:
                 dd = SOUND_DIST.get(s.get("dist"), 110.0)
@@ -411,8 +476,8 @@ class Bot:
             self.recover_from = None
         recovering = self.recover_from is not None
         alive_n = obs.get("alive")
-        survive = (t >= PARAMS["no_fight_t"]) or (isinstance(alive_n, int) and alive_n <= PARAMS["survive_alive"]
-                                                    and t >= PARAMS["survive_t"])
+        survive = (t >= self.T["no_fight_t"]) or (isinstance(alive_n, int) and alive_n <= PARAMS["survive_alive"]
+                                                    and t >= self.T["survive_t"])
         no_optional = survive or recovering or n_hunters > PARAMS["detail_max_hunters"]
 
         # ---- offer
@@ -523,7 +588,7 @@ class Bot:
                 + (4.0 if focus else 0.0) + (3.0 if finishing else 0.0) - 1.5 * friends
             if want and sc > tscore:
                 tscore, target, fight_ok, t_finish = sc, m, ok, finishing
-        if not self.ffa and t >= PARAMS["cluster_t"] and "lightning" in my_kinds:
+        if not self.ffa and t >= self.T["cluster_t"] and "lightning" in my_kinds:
             clus = [m for m in enemies if hyp(x, y, m["pos"][0], m["pos"][1]) < self.light_range]
             if len(clus) >= PARAMS["cluster_n"]:
                 target, fight_ok = clus[0], True  # packed final circle: chain lightning hits several
@@ -578,9 +643,11 @@ class Bot:
         # v5: a second weapon (laser/lightning) is the biggest DPS lever; loot whenever no gunner has
         # line of sight and we are not under fire (not only after 12 s of total quiet)
         loot_ok = (not shooters) and (not engaged) and hp >= 0.5 * mhp
-        lg_early = None
-        if hide_needed and loot_ok and not fighting and chase is None and not out_now and not urgent:
-            lg_early = self.loot_goal(obs, me, x, y, z, act)
+        # I1: economy goals come from the loot memory, whatever the mode branch, whenever nobody has
+        # line of sight to us and we are not under fire
+        econ = None
+        if not fighting and chase is None and not out_now and not shooters and not engaged                 and hp >= PARAMS["econ_min_hp"] * mhp and t < self.T["final_center_t"]:
+            econ = self.econ_goal(obs, me, x, y, z, t, act, urgent and zdist > 8)
         if out_now or (urgent and zdist > 8):
             goal = (zgx, zgy)
             speed = 1.0
@@ -606,10 +673,9 @@ class Bot:
             goal = (chase["pos"][0], chase["pos"][1])
             mode = "chase"
             speed = 1.0
-        elif hide_needed and loot_ok and lg_early is not None:
-            goal = lg_early
-            mode = "loot"
-            speed = PARAMS["silent_move"] if not enemies else 1.0
+        elif econ is not None:
+            goal, mode = econ
+            speed = 1.0 if (enemies or t < self.arm_t or mode == "corpse") else PARAMS["silent_move"]
         elif hide_needed and self.cover is not None:
             goal = self.cover
             mode = "hide"
@@ -618,7 +684,7 @@ class Bot:
                 boost = True
         else:
             # safe: loot if close, otherwise go/stay in a hidden spot in the zone
-            lg = self.loot_goal(obs, me, x, y, z, act) if (loot_ok or not recent_hostile) else None
+            lg = None
             fg = None
             if lg is None and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp and t < self.endgame_t \
                     and need_speed < 0.5 * silent:
@@ -632,7 +698,7 @@ class Bot:
                 mode = "farm-seek"
                 speed = PARAMS["silent_move"]
             elif (not self.ffa and self.hunter_c is not None and t - self.hunter_c[2] < 30.0
-                  and self.inner_edge_t <= t < PARAMS["final_center_t"] and not urgent
+                  and self.inner_edge_t <= t < self.T["final_center_t"] and not urgent
                   and hyp(self.hunter_c[0], self.hunter_c[1], *zone["next_center"]) > zone["next_radius"]):
                 # v4 card C: stand inside the next circle on the hunters' side so their approach runs
                 # through the zone edge (they eat zone damage, we stay in and regen)
@@ -657,6 +723,26 @@ class Bot:
                     goal = self.cover
                     mode = "camp"
                     speed = PARAMS["silent_move"]
+
+        # ---- I3: mode commitment. A new movement mode replaces the committed one only after
+        # mode_commit_s, or at once on a hard trigger (damage spike, a new mech with line of sight,
+        # low HP, zone).
+        self.hp_hist.append((t, hp))
+        self.hp_hist = [h for h in self.hp_hist if t - h[0] <= 1.0]
+        spike = (self.hp_hist[0][1] - hp) > PARAMS["dmg_spike_frac"] * mhp
+        los_ids = {int(m["id"]) for (m, _) in shooters}
+        if target is not None and target.get("kind") == "mech":
+            los_ids.add(int(target["id"]))
+        new_los = bool(los_ids - self.prev_los_ids)
+        self.prev_los_ids = los_ids
+        hard = out_now or mode == "zone" or spike or new_los or hp < PARAMS["retreat_hp"] * mhp
+        if mode != self.cmode:
+            if (not hard and self.cmode is not None and self.cmode_state is not None
+                    and t - self.cmode_t < PARAMS["mode_commit_s"]):
+                mode, goal, speed, boost = self.cmode_state
+            else:
+                self.cmode, self.cmode_t = mode, t
+        self.cmode_state = (mode, goal, speed, boost)
 
         mv = [0.0, 0.0]
         gdir = None  # v5: unit direction toward the movement goal (None = holding position)
@@ -736,7 +822,7 @@ class Bot:
         if target is None and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp and t < self.endgame_t:
             target = self.farm_target(obs, x, y, z, muz_h)
             if target is not None:
-                mode = "farm"
+                mode += "+farm"  # I3: the label is the movement mode; fire targets are a suffix
         if target is None and chase is not None:
             aim, _ = self.fire_control(me, chase, weapons, x, y, z, muz_h)  # pre-aim, no blind fire
         elif target is not None:
@@ -748,10 +834,18 @@ class Bot:
                 # clock; only a laser already charging may finish its shot
                 fire = [bool(f and wp and wp.get("kind") == "laser" and (wp.get("charge") or 0) > 0)
                         for f, wp in zip(fire, list(weapons) + [None, None])]
-            if mode in ("travel", "loot", "camp", "idle"):
-                mode = "fight"
+            if mode.split("+")[0] in ("travel", "loot", "camp", "idle", "arm", "cubes", "corpse"):
+                mode += "+shoot"
         if aim is None:
-            aim = self.scan_aim(obs, x, y, t, mv, threats)
+            # I1: a 360 deg torso sweep at spawn (and while unarmed with nothing remembered) fills the
+            # loot memory: the far vision cone is only 120 deg
+            w1 = weapons[1] if len(weapons) > 1 else None
+            if t < self.arm_t and (w1 is None or w1.get("kind") == "mortar") and mode.split("+")[0] != "arm"                     and t - self.sweep_last > 10.0 and not shooters and not engaged:
+                self.sweep_last, self.sweep_until = t, t + 2.0
+            if t < self.sweep_until and not shooters and not engaged:
+                aim = [wrap((me.get("aim") or self.last_aim)[0] + 1.2), 0.0]
+            else:
+                aim = self.scan_aim(obs, x, y, t, mv, threats)
         else:
             # laser charging slows us; fine. keep aim
             pass
@@ -983,6 +1077,128 @@ class Bot:
         f = (bd - stand) / bd
         return (x + (px - x) * f, y + (py - y) * f)
 
+    # ------------------------------------------------------------------ I1 world memory + economy
+    def update_memory(self, obs, me, x, y, z, eye_h, t) -> None:
+        """Pickups, crates and cubes are listed only while visible: remember them until we see the
+        spot empty (or a took / take_failed:gone event). Mechs: last seen position (corpse looting)."""
+        for p in obs.get("pickups") or []:
+            try:
+                self.mem_pick[int(p["id"])] = (p.get("kind"), tuple(p["pos"]), t)
+            except Exception:
+                pass
+        for c in obs.get("crates") or []:
+            try:
+                self.mem_crate[int(c["id"])] = (tuple(c["pos"]), t)
+            except Exception:
+                pass
+        for c in obs.get("cubes") or []:
+            try:
+                self.mem_cube[int(c["id"])] = (tuple(c["pos"]), t)
+            except Exception:
+                pass
+        for m in obs.get("mechs") or []:
+            if m.get("kind") == "mech" and m.get("id") != me.get("id"):
+                self.mech_last[int(m["id"])] = (m["pos"][0], m["pos"][1], m["pos"][2], t)
+        # expiry: a remembered item inside our current view with a clear sight line that is not listed
+        W = self.world
+        yaw = (me.get("aim") or self.last_aim or [0.0])[0]
+        cand = []
+        for store, item_h in ((self.mem_pick, 0.5), (self.mem_crate, 1.2), (self.mem_cube, 0.5)):
+            for k, v in store.items():
+                pos, ts = (v[1], v[2]) if store is self.mem_pick else (v[0], v[1])
+                if ts >= t:
+                    continue
+                d = hyp(x, y, pos[0], pos[1])
+                if d <= 0.85 * self.near_range or (
+                        d <= 0.9 * self.vis_range and abs(wrap(math.atan2(pos[1] - y, pos[0] - x) - yaw)) < self.fov_half - 0.1):
+                    cand.append((d, store, k, pos, item_h))
+        cand.sort(key=lambda c: c[0])
+        for d, store, k, pos, item_h in cand[:8]:  # cap the sight checks per decision
+            if d > 6.0 and W is not None and W.sight_blocked((x, y, z + eye_h), (pos[0], pos[1], pos[2] + item_h)):
+                continue
+            store.pop(k, None)
+        if self.corpse is not None and (t - self.corpse[3] > PARAMS["corpse_s"] or hyp(x, y, self.corpse[0], self.corpse[1]) < 5.0):
+            self.corpse = None
+
+    def known_mechs(self, t: float, me_id) -> List[Tuple[float, float]]:
+        return [(v[0], v[1]) for k, v in self.mech_last.items() if t - v[3] < 10.0 and k != me_id]
+
+    def econ_goal(self, obs, me, x, y, z, t, act, urgent: bool) -> Optional[Tuple[Tuple[float, float], str]]:
+        """I1: the best remembered economy goal (second weapon, cubes, the last kill's drop), or None.
+        Also issues `take` when a better weapon is within reach."""
+        W = self.world
+        weapons = me.get("weapons") or [None, None]
+        held = [w.get("kind") for w in weapons if w]
+        slot1 = weapons[1] if len(weapons) > 1 else None
+        s1k = slot1.get("kind") if slot1 else None
+        want_w = slot1 is None or s1k == "mortar"
+        known = self.known_mechs(t, me.get("id"))
+        energy = me.get("energy", 0.0) or 0.0
+        best, bc, label = None, 1e9, None
+        wrange = PARAMS["arm_range"] if t < self.arm_t else PARAMS["arm_late_range"]
+        for pid, (kind, pos, ts) in list(self.mem_pick.items()):
+            if kind in held or kind == "gun" or kind is None:
+                continue
+            if WEAPON_RANK.get(kind, 0) <= WEAPON_RANK.get(s1k, -1):
+                continue
+            if t - self.taken_fail.get(pid, -99) < 3.0 or self.econ_black.get(("p", pid), -99) > t:
+                continue
+            px, py, pz = pos
+            d = hyp(x, y, px, py)
+            if d < self.reach - 0.3 and abs(pz - z) < 4:
+                if slot1 is not None and slot1.get("kind") == "laser" and slot1.get("charge"):
+                    continue
+                act["take"] = pid
+                if slot1 is not None:
+                    act["drop"] = 1
+                return None
+            if not want_w or d > wrange:
+                continue
+            roof = W is not None and pz - W.ground_at(px, py) > PARAMS["loot_roof_dz"]
+            if roof and pz - z > min(self.max_climb, self.max_climb * max(energy, 30.0) / 100.0 + 8.0):
+                continue
+            if any(hyp(kx, ky, px, py) < 0.8 * d for kx, ky in known):
+                continue  # contested: a known mech is nearer to it than we are
+            if self.safe_point(obs, px, py, t) >= 1:
+                continue
+            c = d * (1.0 if kind in ("lightning", "laser") else PARAMS["mortar_cost"]) + (PARAMS["roof_cost_m"] if roof else 0.0)
+            if c < bc:
+                best, bc, label = (px, py), c, ("p", pid)
+        # cubes (kill drops, crates, drones): remembered set within cube_range in the safe zone
+        crange = PARAMS["cube_range"]
+        for cid, (pos, ts) in self.mem_cube.items():
+            px, py, pz = pos
+            if abs(pz - z) > 4 or self.econ_black.get(("q", cid), -99) > t:
+                continue
+            d = hyp(x, y, px, py)
+            if d > crange or self.safe_point(obs, px, py, t) >= 1:
+                continue
+            if any(hyp(kx, ky, px, py) < 0.8 * d for kx, ky in known):
+                continue
+            c = d * (0.7 if want_w else 1.0)
+            if c < bc:
+                best, bc, label = (px, py), c, ("q", cid)
+        if best is None and self.corpse is not None:
+            px, py, pz, _ = self.corpse
+            if self.safe_point(obs, px, py, t) < 1 and self.econ_black.get(("k", self.corpse[3]), -99) <= t:
+                best, label = (px, py), ("k", self.corpse[3])
+        if best is None:
+            self.econ_key = None
+            return None
+        if urgent and hyp(x, y, *best) > 30.0:
+            return None
+        # give up on goals that stop getting closer (blocked climb, unreachable courtyard)
+        d = hyp(x, y, *best)
+        if label != self.econ_key:
+            self.econ_key, self.econ_best = label, (d, t)
+        elif d < self.econ_best[0] - 2.0:
+            self.econ_best = (d, t)
+        elif t - self.econ_best[1] > PARAMS["econ_giveup_s"]:
+            self.econ_black[label] = t + 40.0
+            self.econ_key = None
+            return None
+        return best, ("arm" if label[0] == "p" else "corpse" if label[0] == "k" else "cubes")
+
     # ------------------------------------------------------------------ loot
     def loot_goal(self, obs, me, x, y, z, act) -> Optional[Tuple[float, float]]:
         weapons = me.get("weapons") or [None, None]
@@ -991,7 +1207,7 @@ class Bot:
         best = None
         bd = 1e9
         W = self.world
-        lim = PARAMS["loot_early_range"] if obs["t"] < PARAMS["loot_early_t"] else 90.0
+        lim = PARAMS["loot_early_range"] if obs["t"] < self.T["loot_early_t"] else 90.0
         for p in obs.get("pickups") or []:
             kind = p.get("kind")
             pid = int(p.get("id", -1))
