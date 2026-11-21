@@ -81,6 +81,11 @@ PARAMS = {
     # fights only when <= detail_max_hunters known hunters are within detail_range and the target's
     # HP <= detail_hp_ratio x ours; any second hunter seen/heard within detail_abort_range aborts.
     "detail_range": 120.0,
+    # v5 loot: a pickup more than loot_roof_dz above the terrain under it is on a roof; before
+    # loot_early_t (first hunters arrive) weapon pickups are sought up to loot_early_range.
+    "loot_roof_dz": 2.0,
+    "loot_early_t": 45.0,
+    "loot_early_range": 200.0,
     "detail_max_hunters": 1,
     "detail_hp_ratio": 1.2,
     "detail_abort_range": 100.0,
@@ -151,7 +156,7 @@ def find_map_dir(hello: Dict[str, Any]) -> Optional[str]:
 
 
 class Bot:
-    name = "survivor-v4"
+    name = "survivor-v5"
 
     def __init__(self, hello: Dict[str, Any]) -> None:
         cfg = hello.get("config") or {}
@@ -165,6 +170,8 @@ class Bot:
         self.light_cone = math.radians((w.get("lightning") or {}).get("cone_deg", 30.0))
         self.laser_charge = (w.get("laser") or {}).get("charge", 0.75)
         self.reach = (cfg.get("loot") or {}).get("pickup_radius", 4.0)
+        # v5: FFA evidence needs an HP drop larger than 3 drone bullets (unseen drones hit too)
+        self.ffa_drop = max(40.0, 3.0 * float((cfg.get("npc") or {}).get("damage", 25)) + 1.0)
         self.near_range = (cfg.get("vision") or {}).get("near_range", 45.0)
         # ---- v2: everything the gate / aim / dodge needs, derived from the live config
         self.wcfg = {k: dict(v) for k, v in w.items() if isinstance(v, dict)}
@@ -463,6 +470,7 @@ class Bot:
         target = None
         tscore = -1e9
         fight_ok = False
+        t_finish = False
         for m in enemies[:5] + npcs[:3]:
             mx, my_, mz = m["pos"]
             dm = math.dist((x, y, z), (mx, my_, mz))
@@ -509,7 +517,7 @@ class Bot:
             sc = -ttk_us + (5.0 if attacker else 0.0) + (3.0 if ok else 0.0) + (1.0 if is_mech else -2.0) \
                 + (4.0 if focus else 0.0) + (3.0 if finishing else 0.0) - 1.5 * friends
             if want and sc > tscore:
-                tscore, target, fight_ok = sc, m, ok
+                tscore, target, fight_ok, t_finish = sc, m, ok, finishing
         if not self.ffa and t >= PARAMS["cluster_t"] and "lightning" in my_kinds:
             clus = [m for m in enemies if hyp(x, y, m["pos"][0], m["pos"][1]) < self.light_range]
             if len(clus) >= PARAMS["cluster_n"]:
@@ -562,6 +570,12 @@ class Bot:
         if W and threats and hide_needed and elapsed < 6:
             if t - self.cover_t > 0.5 or self.cover is None:
                 self.choose_cover(obs, x, y, z, threats, t)
+        # v5: a second weapon (laser/lightning) is the biggest DPS lever; loot whenever no gunner has
+        # line of sight and we are not under fire (not only after 12 s of total quiet)
+        loot_ok = (not shooters) and (not engaged) and hp >= 0.5 * mhp
+        lg_early = None
+        if hide_needed and loot_ok and not fighting and chase is None and not out_now and not urgent:
+            lg_early = self.loot_goal(obs, me, x, y, z, act)
         if out_now or (urgent and zdist > 8):
             goal = (zgx, zgy)
             speed = 1.0
@@ -587,6 +601,10 @@ class Bot:
             goal = (chase["pos"][0], chase["pos"][1])
             mode = "chase"
             speed = 1.0
+        elif hide_needed and loot_ok and lg_early is not None:
+            goal = lg_early
+            mode = "loot"
+            speed = PARAMS["silent_move"] if not enemies else 1.0
         elif hide_needed and self.cover is not None:
             goal = self.cover
             mode = "hide"
@@ -595,7 +613,7 @@ class Bot:
                 boost = True
         else:
             # safe: loot if close, otherwise go/stay in a hidden spot in the zone
-            lg = None if recent_hostile else self.loot_goal(obs, me, x, y, z, act)
+            lg = self.loot_goal(obs, me, x, y, z, act) if (loot_ok or not recent_hostile) else None
             fg = None
             if lg is None and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp and t < self.endgame_t \
                     and need_speed < 0.5 * silent:
@@ -636,9 +654,12 @@ class Bot:
                     speed = PARAMS["silent_move"]
 
         mv = [0.0, 0.0]
+        gdir = None  # v5: unit direction toward the movement goal (None = holding position)
         if goal is not None:
             mv = self.steer(x, y, goal, t, me)
             mvn = math.hypot(*mv)
+            if mvn > 0:
+                gdir = (mv[0] / mvn, mv[1] / mvn)
             dgoal = hyp(x, y, goal[0], goal[1])
             if dgoal < 2.0:
                 mv = [0.0, 0.0]
@@ -649,6 +670,12 @@ class Bot:
         # ---- v2 dodges: jink against long-range gun fire, step out of predicted mortar splash
         jink = self.jink_vector(t, x, y, shooters)
         if jink is not None and not out_now:
+            if gdir is not None:
+                # v5: with a goal, drop the jink component that points back against it; otherwise the
+                # alternating jink cancels every walk to cover (full jink only while holding position)
+                dp = jink[0] * gdir[0] + jink[1] * gdir[1]
+                if dp < 0:
+                    jink = (jink[0] - dp * gdir[0], jink[1] - dp * gdir[1])
             mv = [mv[0] * 0.6 + jink[0], mv[1] * 0.6 + jink[1]]
             n = math.hypot(*mv) or 1.0
             mv = [mv[0] / n, mv[1] / n]
@@ -711,6 +738,11 @@ class Bot:
             aim, fire = self.fire_control(me, target, weapons, x, y, z, muz_h)
             if PARAMS["pacifist"] and target.get("kind") == "mech":
                 fire = [False, False]
+            if mode.startswith(("hide", "zone-cover")) and not fight_ok and not t_finish:
+                # v5: retreating to cover: keep aiming, but returning fire restarts our own regen
+                # clock; only a laser already charging may finish its shot
+                fire = [bool(f and wp and wp.get("kind") == "laser" and (wp.get("charge") or 0) > 0)
+                        for f, wp in zip(fire, list(weapons) + [None, None])]
             if mode in ("travel", "loot", "camp", "idle"):
                 mode = "fight"
         if aim is None:
@@ -907,7 +939,7 @@ class Bot:
             self.enemy_hp[mid] = (hpm, t)
             if prev is None or t - prev[1] > 0.25 or t - self.our_hits.get(mid, -99.0) < 0.5:
                 continue
-            if prev[0] - hpm >= 40 and not any(hyp(n["pos"][0], n["pos"][1], m["pos"][0], m["pos"][1]) < 100 for n in npcs):
+            if prev[0] - hpm >= self.ffa_drop and not any(hyp(n["pos"][0], n["pos"][1], m["pos"][0], m["pos"][1]) < 100 for n in npcs):
                 self.ffa_ev += 1
                 mf.log(f"ffa evidence: mech {mid} lost {prev[0] - hpm:.0f} HP at t={t:.1f} (not us)")
         alive = obs.get("alive")
@@ -953,6 +985,8 @@ class Bot:
         slot1 = weapons[1] if len(weapons) > 1 else None
         best = None
         bd = 1e9
+        W = self.world
+        lim = PARAMS["loot_early_range"] if obs["t"] < PARAMS["loot_early_t"] else 90.0
         for p in obs.get("pickups") or []:
             kind = p.get("kind")
             pid = int(p.get("id", -1))
@@ -965,8 +999,13 @@ class Bot:
                 continue
             px, py, pz = p["pos"]
             d = hyp(x, y, px, py)
-            if abs(pz - z) > 6 and d < 10:
-                continue  # on a roof we can't easily reach
+            # v5: roof or not from the map (pickup height above the terrain there), not from our z,
+            # so pickups on sloped open ground are kept
+            if W is not None:
+                if pz - W.ground_at(px, py) > PARAMS["loot_roof_dz"]:
+                    continue
+            elif abs(pz - z) > 6 and d < 10:
+                continue
             if d < self.reach - 0.3 and abs(pz - z) < 4:
                 act["take"] = p["id"]
                 if slot1 is not None:
@@ -975,8 +1014,10 @@ class Bot:
                     else:
                         act["drop"] = 1
                 return None
-            if d < 90 and d < bd and abs(pz - z) < 5 and self.safe_point(obs, px, py, obs["t"]) < 1:
-                bd, best = d, (px, py)
+            # v5: lightning/laser are worth a longer walk than a mortar; search wider early in the match
+            de = d * (1.0 if kind in ("lightning", "laser") else 2.0)
+            if d < lim and de < bd and (W is not None or abs(pz - z) < 5) and self.safe_point(obs, px, py, obs["t"]) < 1:
+                bd, best = de, (px, py)
         for c in obs.get("cubes") or []:
             cxp, cyp, czp = c["pos"]
             d = hyp(x, y, cxp, cyp)
