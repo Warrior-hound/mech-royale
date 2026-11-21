@@ -214,6 +214,16 @@ class Bot:
         # v3: focus fire. The mech we damaged last and when; we finish it instead of letting it regen.
         self.focus_id: Optional[int] = None
         self.focus_t = -99.0
+        # v3 FFA detector: practice house bots never damage each other, a free-for-all does. Evidence =
+        # a visible mech losing >= 40 HP in one decision that we did not hit and no drone is near
+        # (zone <= 26/decision, drone shot 25), or a death we
+        # did not cause before the zone bites.
+        self.ffa = False
+        self.ffa_ev = 0
+        self.enemy_hp: Dict[int, Tuple[float, float]] = {}
+        self.prev_alive: Optional[int] = None
+        self.our_hits: Dict[int, float] = {}
+        self.our_kill_t = -99.0
         self.path_partial = False
         self.climb_until = -1.0  # wall-time cap for the cover search inside one decision
 
@@ -328,6 +338,7 @@ class Bot:
                 if dd < 120:
                     self.last_hostile_t = max(self.last_hostile_t, t - 3.0)
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
+        self.detect_ffa(obs, t)
 
         # ---- offer
         off = obs.get("offer")
@@ -383,7 +394,7 @@ class Bot:
             their_dps += mult * PARAMS["enemy_aim_mult"] * sum(
                 self.weapon_dps(k if isinstance(k, str) else (k or {}).get("kind"), dm, my_speed) for k in kinds)
         ttk_them = hp / their_dps if their_dps > 1e-6 else 1e9
-        k_gate = PARAMS["engage_k"] * (PARAMS["endgame_k_mult"] if t >= self.endgame_t else 1.0)
+        k_gate = PARAMS["ffa_engage_k" if self.ffa else "engage_k"] * (PARAMS["endgame_k_mult"] if t >= self.endgame_t else 1.0)
 
         # ---- target selection (things in our line of sight)
         target = None
@@ -418,6 +429,9 @@ class Bot:
                 ok = ok or want
             else:
                 want = ok or attacker
+                if self.ffa and not (finishing or (attacker and ok)):
+                    # FFA: survival is the score. Let others trade; shoot only to finish or defend
+                    want, ok = attacker, False
             # v3: isolated hunters first (fewer friends within 40 m = less return fire while we kill it)
             friends = sum(1 for o in enemies if o is not m and hyp(o["pos"][0], o["pos"][1], mx, my_) < 40)
             sc = -ttk_us + (5.0 if attacker else 0.0) + (3.0 if ok else 0.0) + (1.0 if is_mech else -2.0) \
@@ -459,7 +473,7 @@ class Bot:
         # v3: chase the focus target after it breaks LOS (the 5 s memory gives its true position),
         # so it can't regen; only when we are healthier than it and nobody else is shooting us
         chase = None
-        if not fighting and self.focus_id is not None and (t - self.focus_t) < 6.0 and not shooters \
+        if not fighting and not self.ffa and self.focus_id is not None and (t - self.focus_t) < 6.0 and not shooters \
                 and hp >= PARAMS["chase_min_hp"] * mhp and t < self.endgame_t:
             for m in enemies:
                 if int(m["id"]) == self.focus_id:
@@ -627,7 +641,7 @@ class Bot:
         act.update(move=[round(mv[0], 3), round(mv[1], 3)], aim=[round(aim[0], 4), round(aim[1], 4)],
                    fire=fire, boost=bool(boost), jump=bool(jump))
         self.mode = mode
-        mf.draw.label(f"{mode} hp{hp:.0f} e{len(enemies)} {self.gate_info}")
+        mf.draw.label(f"{'F' if self.ffa else 'S'} {mode} hp{hp:.0f} e{len(enemies)} {self.gate_info}")
         return act
 
     # ------------------------------------------------------------------ v2 models
@@ -782,6 +796,40 @@ class Bot:
                     continue
                 best, bd = m, d
         return best
+
+    def detect_ffa(self, obs, t: float) -> None:
+        if self.ffa:
+            return
+        me_id = (obs.get("self") or {}).get("id", self.me_id)
+        for e in obs.get("events") or []:
+            if e.get("type") == "hit" and isinstance(e.get("target"), int):
+                self.our_hits[e["target"]] = t
+            elif e.get("type") == "kill":
+                self.our_kill_t = t
+        mechs = [m for m in obs.get("mechs") or [] if m.get("kind") == "mech" and m.get("id") != me_id]
+        npcs = [m for m in obs.get("mechs") or [] if m.get("kind") == "npc"]
+        for m in mechs:
+            mid = int(m["id"])
+            hpm = m.get("hp")
+            if hpm is None:
+                continue
+            prev = self.enemy_hp.get(mid)
+            self.enemy_hp[mid] = (hpm, t)
+            if prev is None or t - prev[1] > 0.25 or t - self.our_hits.get(mid, -99.0) < 0.5:
+                continue
+            if prev[0] - hpm >= 40 and not any(hyp(n["pos"][0], n["pos"][1], m["pos"][0], m["pos"][1]) < 100 for n in npcs):
+                self.ffa_ev += 1
+                mf.log(f"ffa evidence: mech {mid} lost {prev[0] - hpm:.0f} HP at t={t:.1f} (not us)")
+        alive = obs.get("alive")
+        if isinstance(alive, int):
+            zone = obs.get("zone") or {}
+            if self.prev_alive is not None and alive < self.prev_alive and t - self.our_kill_t > 0.5 and                     t < (zone.get("shrink_start", 60.0) if zone.get("radius", 0) >= 500 else 0.0):
+                self.ffa_ev += 1
+                mf.log(f"ffa evidence: a mech died at t={t:.1f} (not our kill, no zone yet)")
+            self.prev_alive = alive
+        if self.ffa_ev >= 2:
+            self.ffa = True
+            mf.log(f"FFA mode detected at t={t:.1f}")
 
     def farm_seek(self, obs, x, y, z) -> Optional[Tuple[float, float]]:
         """v3: walk toward the nearest seen drone (2 cubes) or crate (1 cube) to farm it: stop at
