@@ -636,7 +636,10 @@ class Bot:
         silent = 0.42 * self.walk  # < 5 m/s: no step sounds
         # I3: hysteresis on the rotation trigger (enter at 0.75 x silent pace, leave below 0.6 x)
         urgent_k = 0.6 if getattr(self, "urgent_prev", False) else 0.75
-        urgent = out_now or need_speed > urgent_k * silent or (zone["shrink_start"] - t < 15 and zdist > 5)
+        # a camp spot already checked safe for the next circle (safe_point) counts as arrived
+        camp_ok = self.cmode == "camp" and self.cover is not None and zdist < PARAMS["camp_stay_m"] \
+            and self.safe_point(obs, *self.cover, t) < 1
+        urgent = out_now or need_speed > urgent_k * silent or (zone["shrink_start"] - t < 15 and zdist > 5 and not camp_ok)
         self.urgent_prev = urgent
 
         speed = PARAMS["silent_move"]  # silent walk
@@ -785,7 +788,10 @@ class Bot:
         for i in los_ids:
             self.los_seen[i] = t
         self.prev_los_ids = los_ids
-        hard = out_now or mode == "zone" or spike or new_los or hp < PARAMS["retreat_hp"] * mhp
+        # low HP is a trigger when it is crossed, not on every decision spent below it
+        low = hp < PARAMS["retreat_hp"] * mhp
+        hard = out_now or mode == "zone" or spike or new_los or (low and not getattr(self, "low_prev", False))
+        self.low_prev = low
         if mode != self.cmode:
             if (not hard and self.cmode is not None and self.cmode_state is not None
                     and t - self.cmode_t < PARAMS["mode_commit_s"]):
@@ -825,7 +831,7 @@ class Bot:
         if dodge is not None:
             mv = list(dodge)
             boost = me.get("energy", 0) > 10 and me.get("grounded", True)
-            mode = "dodge"
+            mode = mode.split("+")[0] + "+dodge"  # a reflex over the committed movement mode
 
         # ---- stuck detection / unstick
         jump = False
