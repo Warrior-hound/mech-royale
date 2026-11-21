@@ -1,4 +1,4 @@
-# survivor-v1: a survival-first mechfight/1 bot
+# survivor-v2: a survival-first mechfight/1 bot
 
 One Python file per concern, standard library only (no pip installs), so the image builds in seconds
 and nothing can break at build time.
@@ -53,20 +53,67 @@ and nothing can break at build time.
    it walks to the closest reachable point and jets over toward the goal. Any exception in `act` returns
    a safe action (walk to the next circle, keep aim); the wrapper adds a second safety net.
 
+## v2 changes (every number from `hello.config`; free parameters in `PARAMS` at the top of `bot.py`)
+
+- **Fire discipline.** Each gun bullet fires only if its predicted hit probability is at least
+  `gun_min_hit_p`: Gaussian spread (sigma = `spread_deg`) plus the displacement of a randomly
+  accelerating target over the flight time, against the body cross-section (radius + bullet radius,
+  half the height), using the *current* torso aim. Lead is the closed-form intercept
+  |D + V t| = s t + 3 (the shot spawns 3 m out), with both ends advanced by one tick. The laser
+  releases when the beam's hit probability is at least `laser_min_hit_p`.
+- **Engagement gate (Lanchester/TTK).** `their_dps` sums every enemy with line of sight to our body
+  (weapons from `mechs[].weapons`, sustained DPS from config, cube multipliers, `enemy_aim_mult`).
+  A mech target is fought when `ttk_us < k * ttk_them` (`engage_k`, times `endgame_k_mult` from the
+  start of the second-to-last zone phase). Fight = hold ground with jinks, or close to 0.7 x the
+  lightning range when holding lightning. Otherwise hide in cover and regen; attackers are still shot
+  back opportunistically.
+- **Dodges.** Jinks against gun shooters farther than `jink_min_d` = 252 x sqrt(2 (R + r_b) / a),
+  about 76 m (closer than that a full swerve during the flight can't clear our radius). The jink
+  flips at random intervals of about one bullet flight time. Mortar shells: predict the ballistic
+  impact. If our coasting position at impact is inside splash + radius + margin, run away from it
+  (boost). Lasers are hitscan and can't be dodged, so a charging laser aimed at us takes the torso
+  facing (front arc, no x1.5).
+- **Zone.** The rotation is timed on the remaining A* path length (or straight x `detour`) against
+  the moment the shrinking edge passes our position. From the second-to-last phase, the goal is the
+  circle centre (HP race). Climbs onto roofs or out of courtyards get a jet time from the height
+  (rise / 8.9 m/s + 1 s) and trigger beyond 3 m (v1: fixed 2.5 s, beyond 15 m only). Stuck detection
+  also fires on "commanded to move, < 1.5 m progress in 1 s".
+- **Cover.** 4 rings x 16 bearings out to `cover_radius` (48 m), searched away from the threat first.
+  Off-level candidates (roofs) are rejected; detours are charged.
+- **Economy.** Lightning > laser > mortar (replay winner: gun + lightning). Upgrades put plating
+  first. Drones and crates within `farm_range` are farmed for cubes while it's quiet, HP is at least
+  `farm_min_hp`, and the endgame hasn't started.
+
+## Scenario harness (`tools/scenarios.py`, v1 snapshot vs v2)
+
+Deterministic checks from the SPEC physics on the real map, with exact prism/terrain/canopy LOS
+from `tools/losmodel.py`. Opponents are scripted, so these numbers compare controllers; they don't
+predict scores.
+
+| scenario | v1 | v2 |
+| --- | --- | --- |
+| A aim, hits/s on a 200 m jinking target (other rows within +/-5%) | 0.23 | 0.45 |
+| B under fire from a perfect-lead gunner, 18 spots, 15 s: damage taken / dealt | 1151 / 1005 | 819 / 1152 |
+| B rear damage taken | 34 | 11 |
+| C mortar lobber, 20 s x 6: damage taken | 1120 | 0 |
+| D zone, 10 seeds to 416 s: zone damage / deaths before 415 s | 993 / 3 | 780 / 2 |
+| E cover vs one threat: spot hidden (exact LOS) / shot-proof (oracle: 65% have one within 48 m) | 27% / 20% | 43% / 37% |
+
+Run: `.venv/Scripts/python solution/builders/tools/scenarios.py all` (about 30 s).
+
 ## Timing
 
-All heavy work is precomputed at `hello`. Per decision, the cover search and A* expansion are capped by
-wall-clock time (4 ms and 7 ms). Measured on the kit stream in-process: p50 0.1 ms, p99 4.3 ms,
-max 4.4 ms. Through `docker run --cpus 1 --memory 512m` on a Windows laptop the check reports
-p99 about 20-24 ms, the same as the kit's trivial example bot (p99 25 ms), so that is Docker pipe
-overhead, not bot compute.
+All heavy work is precomputed at `hello`. Per decision, the cover search (5 ms) and A* expansion
+(7 ms) are capped by wall-clock time. v2 on the kit stream, in-process: p50 0.13 ms, p99 5.1 ms,
+max 5.2 ms. Through `docker run --cpus 1 --memory 512m` on the Windows laptop, warm: v2 p99 9.2-9.4 ms
+(v1 5.2 ms on the same run). The first cold run reported p99 25 ms, which is Docker pipe warm-up.
 
 ## Check it
 
 ```sh
-docker build -t survivor-bot .
+docker build -t survivor-v2 .
 python3 check/check.py --map-dir /arena -- docker run --rm -i --network none --cpus 1 --memory 512m \
-  --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 -v "$PWD/arena:/arena:ro" survivor-bot
+  --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 -v "$PWD/arena:/arena:ro" survivor-v2
 ```
 
 MIT licensed (see `LICENSE`).
