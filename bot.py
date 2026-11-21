@@ -86,6 +86,13 @@ PARAMS = {
     "ffa_ev_needed": 1,
     # evidence before ffa_min_t s is ignored (cuts squad false switches; FFA replays: 75% still detected by 20 s)
     "ffa_min_t": 8.0,
+    # v5.2 S0: no first shot at a mech before no_first_shot_t (only shoot mechs that damaged us);
+    # farm drones only with no heard mech within farm_mech_clear_m; until disperse_t walk away from
+    # known mechs while the nearest is closer than disperse_m.
+    "no_first_shot_t": 60.0,
+    "farm_mech_clear_m": 110.0,
+    "disperse_t": 30.0,
+    "disperse_m": 150.0,
     # v5 loot: a pickup more than loot_roof_dz above the terrain under it is on a roof; before
     # loot_early_t (first hunters arrive) weapon pickups are sought up to loot_early_range.
     "loot_roof_dz": 2.0,
@@ -509,11 +516,16 @@ class Bot:
             focus = is_mech and int(m["id"]) == self.focus_id and (t - self.focus_t) < 8.0
             if not is_mech:
                 # drones: when they shoot us, or (v3) to farm cubes while no mech is around
-                want = attacker or (not enemies and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp
+                want = attacker or (not enemies and not recent_hostile and not any(
+                    hyp(p_[0], p_[1], mx, my_) < PARAMS["farm_mech_clear_m"] for p_ in self.pseudo) and hp >= PARAMS["farm_min_hp"] * mhp
                                     and t < self.endgame_t)
                 ok = ok or want
             else:
                 want = ok or attacker
+                if t < PARAMS["no_first_shot_t"] and not attacker:
+                    # v5.2 S0: no first shot at a mech early; a shot starts a retaliation and the
+                    # released hunter joins it (2v1 before 60 s)
+                    want, ok = False, False
                 if self.ffa and not (finishing or (attacker and ok)):
                     # FFA: survival is the score. Let others trade; shoot only to finish or defend
                     want, ok = attacker, False
@@ -579,9 +591,16 @@ class Bot:
         # line of sight and we are not under fire (not only after 12 s of total quiet)
         loot_ok = (not shooters) and (not engaged) and hp >= 0.5 * mhp
         lg_early = None
+        dg = None
+        if t < PARAMS["disperse_t"] and not engaged and not shooters and not out_now and not urgent                 and not fighting and chase is None:
+            dg = self.disperse_goal(obs, x, y, z, enemies, t)
         if hide_needed and loot_ok and not fighting and chase is None and not out_now and not urgent:
             lg_early = self.loot_goal(obs, me, x, y, z, act)
-        if out_now or (urgent and zdist > 8):
+        if dg is not None and not (hide_needed and loot_ok and lg_early is not None):
+            goal = dg
+            mode = "disperse"
+            speed = PARAMS["silent_move"]
+        elif out_now or (urgent and zdist > 8):
             goal = (zgx, zgy)
             speed = 1.0
             mode = "zone"
@@ -984,6 +1003,29 @@ class Bot:
         return (x + (px - x) * f, y + (py - y) * f)
 
     # ------------------------------------------------------------------ loot
+    def disperse_goal(self, obs, x, y, z, enemies, t) -> Optional[Tuple[float, float]]:
+        """v5.2 S0b: early in the match walk to the nearby point farthest from every known mech
+        (seen or heard) inside the next circle (live top bots spread apart from spawn)."""
+        W = self.world
+        pts = [(m["pos"][0], m["pos"][1]) for m in enemies] + [(p[0], p[1]) for p in self.pseudo]
+        if not pts or W is None:
+            return None
+        def sep(px, py):
+            return min(hyp(px, py, ox, oy) for (ox, oy) in pts)
+        here = sep(x, y)
+        if here > PARAMS["disperse_m"]:
+            return None
+        best, bs = None, here + 10.0
+        for k in range(12):
+            a = k * TAU / 12
+            px, py = x + 40.0 * math.cos(a), y + 40.0 * math.sin(a)
+            if not W.walkable(px, py) or self.safe_point(obs, px, py, t) >= 1:
+                continue
+            s_ = sep(px, py)
+            if s_ > bs:
+                bs, best = s_, (px, py)
+        return best
+
     def loot_goal(self, obs, me, x, y, z, act) -> Optional[Tuple[float, float]]:
         weapons = me.get("weapons") or [None, None]
         held = [w.get("kind") for w in weapons if w]
