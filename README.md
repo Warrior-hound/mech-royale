@@ -1,4 +1,4 @@
-# survivor-v2: a survival-first mechfight/1 bot
+# survivor-v3: a survival-first mechfight/1 bot
 
 One Python file per concern, standard library only (no pip installs), so the image builds in seconds
 and nothing can break at build time.
@@ -111,9 +111,9 @@ max 5.2 ms. Through `docker run --cpus 1 --memory 512m` on the Windows laptop, w
 ## Check it
 
 ```sh
-docker build -t survivor-v2 .
+docker build -t survivor-v3 .
 python3 check/check.py --map-dir /arena -- docker run --rm -i --network none --cpus 1 --memory 512m \
-  --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 -v "$PWD/arena:/arena:ro" survivor-v2
+  --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 -v "$PWD/arena:/arena:ro" survivor-v3
 ```
 
 MIT licensed (see `LICENSE`).

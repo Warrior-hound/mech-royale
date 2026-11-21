@@ -46,7 +46,17 @@ PARAMS = {
     "target_accel_sigma": 6.0,
     # Engagement gate: engage when ttk_us < k * ttk_them. >1 = take even fights (practice: kills
     # are the only points), <1 = only clearly favourable fights (final FFA: survival is the score).
-    "engage_k": 0.9,
+    # v3: squad practice = each house-bot death before ours is +1 place, and house bots only die to
+    # us or the zone, so take even-to-unfavourable fights (k > 1). FFA mode uses ffa_engage_k.
+    "engage_k": 1.6,
+    "ffa_engage_k": 0.7,
+    # Below this HP fraction we disengage to regen (45 HP/s after 5 s) unless the target is nearly dead.
+    "retreat_hp": 0.35,
+    # A target at or below this HP fraction is a "finishing" kill: always taken if we out-race it.
+    "finish_frac": 0.3,
+    # Chase a recently damaged target (memory gives its true position for 5 s) when our HP is above this.
+    "chase_min_hp": 0.5,
+    "chase_range": 120.0,
     # In the last two zone phases (HP race, 260 dps final zone ignores armor) k is multiplied by this.
     "endgame_k_mult": 0.5,
     # Enemy aim quality relative to our own hit model (1 = they lead as well as we do). Unknown
@@ -63,8 +73,10 @@ PARAMS = {
     "cover_radius": 48.0,
     # Farm drones / crates for cubes when nothing hostile is near and HP is above this fraction
     # (replay winner farmed 16 cubes). Higher = safer, fewer cubes; firing is heard at 320 m.
-    "farm_min_hp": 0.7,
+    "farm_min_hp": 0.6,
     "farm_range": 60.0,
+    # v3: actively walk to drones / crates seen within this distance while quiet (before endgame).
+    "farm_seek_range": 120.0,
 }
 # v2: lightning first. Measured on the public replay: the winner went gun+lightning (3,000 dmg on
 # 33 lightning hits at 16-43 m); lightning also beats laser in the triangle (short cancels charge).
@@ -112,7 +124,7 @@ def find_map_dir(hello: Dict[str, Any]) -> Optional[str]:
 
 
 class Bot:
-    name = "survivor-v2"
+    name = "survivor-v3"
 
     def __init__(self, hello: Dict[str, Any]) -> None:
         cfg = hello.get("config") or {}
@@ -147,6 +159,7 @@ class Bot:
         # jinking beats a constant-velocity lead only if a full-accel swerve during the bullet flight
         # moves us off the aim point by more than our radius: 0.5*a*t^2 > R  =>  t > sqrt(2R/a)
         self.jink_min_d = self.gun_speed * math.sqrt(2 * (self.radius + self.bullet_r) / max(1.0, self.accel))
+        self.jink_min_d = min(self.jink_min_d, 60.0)  # v3: AIMFIT shows reversals help from ~60 m
         zph = (cfg.get("zone") or {}).get("phases") or []
         # absolute start of the second-to-last hold: the HP race begins there
         tt, starts = 0.0, []
@@ -198,6 +211,9 @@ class Bot:
         self.slow_ticks = 0
         self.tick_t0 = 0.0
         self.cover_budget_s = 0.005
+        # v3: focus fire. The mech we damaged last and when; we finish it instead of letting it regen.
+        self.focus_id: Optional[int] = None
+        self.focus_t = -99.0
         self.path_partial = False
         self.climb_until = -1.0  # wall-time cap for the cover search inside one decision
 
@@ -295,6 +311,13 @@ class Bot:
                         if e["by"] < 100 and e.get("bearing") is not None:
                             b = e["bearing"]
                             self.pseudo.append((x + 80 * math.cos(b), y + 80 * math.sin(b), 1.5, t))
+            elif et == "hit":
+                tg = e.get("target")
+                if isinstance(tg, int) and tg < 100:
+                    self.focus_id, self.focus_t = tg, t
+            elif et == "kill":
+                if e.get("target") == self.focus_id:
+                    self.focus_id = None
             elif et == "take_failed":
                 self.taken_fail[int(e.get("id", -1))] = t
         for s in obs.get("sounds") or []:
@@ -377,13 +400,28 @@ class Bot:
             attacker = (t - self.attackers.get(int(m["id"]), -99)) < 5.0
             tv = m.get("vel") or [0, 0, 0]
             our = my_mult * sum(self.weapon_dps(k, dm, math.hypot(tv[0], tv[1])) for k in my_kinds)
-            ttk_us = m.get("hp", 350.0 if not is_mech else 1400.0) / our if our > 1e-6 else 1e9
+            m_hp = m.get("hp", 350.0 if not is_mech else 1400.0)
+            m_frac = m_hp / max(1.0, m.get("max_hp", 350.0 if not is_mech else 1400.0))
+            ttk_us = m_hp / our if our > 1e-6 else 1e9
             ok = ttk_us < k_gate * ttk_them
+            # v3: a finishing kill is taken whenever we still out-race the shooters (k = 1);
+            # below retreat_hp we only take finishing kills and otherwise go regen
+            finishing = is_mech and m_frac <= PARAMS["finish_frac"] and ttk_us < ttk_them
+            if hp < PARAMS["retreat_hp"] * mhp and not finishing:
+                ok = False
+            ok = ok or finishing
+            focus = is_mech and int(m["id"]) == self.focus_id and (t - self.focus_t) < 8.0
             if not is_mech:
-                want = attacker  # drones: only when they shoot us (they drop cubes, but aggro costs HP)
+                # drones: when they shoot us, or (v3) to farm cubes while no mech is around
+                want = attacker or (not enemies and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp
+                                    and t < self.endgame_t)
+                ok = ok or want
             else:
                 want = ok or attacker
-            sc = -ttk_us + (5.0 if attacker else 0.0) + (3.0 if ok else 0.0) + (1.0 if is_mech else -2.0)
+            # v3: isolated hunters first (fewer friends within 40 m = less return fire while we kill it)
+            friends = sum(1 for o in enemies if o is not m and hyp(o["pos"][0], o["pos"][1], mx, my_) < 40)
+            sc = -ttk_us + (5.0 if attacker else 0.0) + (3.0 if ok else 0.0) + (1.0 if is_mech else -2.0) \
+                + (4.0 if focus else 0.0) + (3.0 if finishing else 0.0) - 1.5 * friends
             if want and sc > tscore:
                 tscore, target, fight_ok = sc, m, ok
         self.gate_info = f"ttk_them {min(ttk_them, 999):.0f} k {k_gate:.2f} sh {len(shooters)}"
@@ -418,7 +456,18 @@ class Bot:
         elapsed = (time.perf_counter() - t0) * 1000
         # v2: a mech fight that passes the gate is taken (hold ground, jink); everything else hides
         fighting = target is not None and fight_ok and target.get("kind") == "mech"
-        hide_needed = (not fighting) and (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < 200)
+        # v3: chase the focus target after it breaks LOS (the 5 s memory gives its true position),
+        # so it can't regen; only when we are healthier than it and nobody else is shooting us
+        chase = None
+        if not fighting and self.focus_id is not None and (t - self.focus_t) < 6.0 and not shooters \
+                and hp >= PARAMS["chase_min_hp"] * mhp and t < self.endgame_t:
+            for m in enemies:
+                if int(m["id"]) == self.focus_id:
+                    fr = m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0))
+                    if fr < hp / mhp and hyp(x, y, m["pos"][0], m["pos"][1]) < PARAMS["chase_range"]:
+                        chase = m
+                    break
+        hide_needed = (not fighting) and (chase is None) and (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < 200)
                                           or (hp < mhp * 0.98 and recent_hostile))
         if W and threats and hide_needed and elapsed < 6:
             if t - self.cover_t > 0.5 or self.cover is None:
@@ -444,6 +493,10 @@ class Bot:
                     f_ = (dtg - 0.6 * self.light_range) / dtg
                     goal = (x + (tx_ - x) * f_, y + (ty_ - y) * f_)
                     mode = "fight-close"
+        elif chase is not None:
+            goal = (chase["pos"][0], chase["pos"][1])
+            mode = "chase"
+            speed = 1.0
         elif hide_needed and self.cover is not None:
             goal = self.cover
             mode = "hide"
@@ -453,9 +506,17 @@ class Bot:
         else:
             # safe: loot if close, otherwise go/stay in a hidden spot in the zone
             lg = None if recent_hostile else self.loot_goal(obs, me, x, y, z, act)
+            fg = None
+            if lg is None and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp and t < self.endgame_t \
+                    and need_speed < 0.5 * silent:
+                fg = self.farm_seek(obs, x, y, z)
             if lg is not None:
                 goal = lg
                 mode = "loot"
+                speed = 0.6
+            elif fg is not None:
+                goal = fg
+                mode = "farm-seek"
                 speed = 0.6
             elif zdist > 3:
                 goal = (zgx, zgy)
@@ -543,7 +604,9 @@ class Bot:
             target = self.farm_target(obs, x, y, z, muz_h)
             if target is not None:
                 mode = "farm"
-        if target is not None:
+        if target is None and chase is not None:
+            aim, _ = self.fire_control(me, chase, weapons, x, y, z, muz_h)  # pre-aim, no blind fire
+        elif target is not None:
             aim, fire = self.fire_control(me, target, weapons, x, y, z, muz_h)
             if mode in ("travel", "loot", "camp", "idle"):
                 mode = "fight"
@@ -642,8 +705,10 @@ class Bot:
         m, dm = best
         flight = dm / self.gun_speed
         if t >= self.jink_next:
-            self.jink_sign = -self.jink_sign if self.rng.random() < 0.75 else self.jink_sign
-            self.jink_next = t + flight * self.rng.uniform(0.6, 1.4) + self.dec_dt
+            # v3 (AIMFIT): house bots lead ~95% of our velocity, so reverse at random 0.4-0.8 s
+            # intervals (37-55% fewer hits at 90-120 m in the 1-D model)
+            self.jink_sign = -self.jink_sign
+            self.jink_next = t + self.rng.uniform(0.4, 0.8)
         b = math.atan2(m["pos"][1] - y, m["pos"][0] - x)
         px, py = -math.sin(b) * self.jink_sign, math.cos(b) * self.jink_sign
         W = self.world
@@ -717,6 +782,31 @@ class Bot:
                     continue
                 best, bd = m, d
         return best
+
+    def farm_seek(self, obs, x, y, z) -> Optional[Tuple[float, float]]:
+        """v3: walk toward the nearest seen drone (2 cubes) or crate (1 cube) to farm it: stop at
+        ~30 m from a drone (inside our accurate gun range, its 25-dmg shots are weak) or ~10 m from
+        a crate. Cubes = +4% HP and damage each, and upgrade offers."""
+        best, bd = None, PARAMS["farm_seek_range"]
+        t = obs["t"]
+        for m in obs.get("mechs") or []:
+            if m.get("kind") == "npc":
+                px, py, pz = m["pos"]
+                d = hyp(x, y, px, py)
+                if d < bd and abs(pz - z) < 5 and self.safe_point(obs, px, py, t) < 1:
+                    best, bd = (px, py, 28.0), d
+        for c in obs.get("crates") or []:
+            px, py, pz = c["pos"]
+            d = hyp(x, y, px, py)
+            if d < bd and abs(pz - z) < 4 and self.safe_point(obs, px, py, t) < 1:
+                best, bd = (px, py, 10.0), d
+        if best is None:
+            return None
+        px, py, stand = best
+        if bd <= stand:
+            return None
+        f = (bd - stand) / bd
+        return (x + (px - x) * f, y + (py - y) * f)
 
     # ------------------------------------------------------------------ loot
     def loot_goal(self, obs, me, x, y, z, act) -> Optional[Tuple[float, float]]:
