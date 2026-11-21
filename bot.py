@@ -103,7 +103,7 @@ PARAMS = {
     "inner_edge_frac": 0.6,
     "inner_edge_phases": 3,
     # Probe P1: never fire at mechs (score = zone/NPC deaths + jackpot only). False in real play.
-    "pacifist": False,
+    "pacifist": True,
 }
 # v2: lightning first. Measured on the public replay: the winner went gun+lightning (3,000 dmg on
 # 33 lightning hits at 16-43 m); lightning also beats laser in the triangle (short cancels charge).
