@@ -77,6 +77,31 @@ PARAMS = {
     "farm_range": 60.0,
     # v3: actively walk to drones / crates seen within this distance while quiet (before endgame).
     "farm_seek_range": 120.0,
+    # v4 card A, defeat in detail (Lanchester n^2: we beat one hunter, lose to two). Optional mech
+    # fights only when <= detail_max_hunters known hunters are within detail_range and the target's
+    # HP <= detail_hp_ratio x ours; any second hunter seen/heard within detail_abort_range aborts.
+    "detail_range": 120.0,
+    "detail_max_hunters": 1,
+    "detail_hp_ratio": 1.2,
+    "detail_abort_range": 100.0,
+    # After each kill: break LOS, move >= recover_move_m silently, regen to >= recover_hp first.
+    "recover_hp": 0.95,
+    "recover_move_m": 20.0,
+    # v4 card B, endgame: no optional fights from no_fight_t; walk to the final centre from
+    # final_center_t; survive mode when alive <= survive_alive after survive_t; lightning on a
+    # cluster of >= cluster_n hunters within lightning range after cluster_t.
+    "no_fight_t": 340.0,
+    "final_center_t": 350.0,
+    "survive_alive": 3,
+    "survive_t": 300.0,
+    "cluster_t": 375.0,
+    "cluster_n": 3,
+    # v4 card D: silent walk fraction of max speed (< 5 m/s makes no step sound).
+    "silent_move": 0.40,
+    # v4 card C: in the last inner_edge_phases phases camp at inner_edge_frac of the next radius from
+    # its centre, on the side facing the hunters, so they approach through the zone edge.
+    "inner_edge_frac": 0.6,
+    "inner_edge_phases": 3,
 }
 # v2: lightning first. Measured on the public replay: the winner went gun+lightning (3,000 dmg on
 # 33 lightning hits at 16-43 m); lightning also beats laser in the triangle (short cancels charge).
@@ -124,7 +149,7 @@ def find_map_dir(hello: Dict[str, Any]) -> Optional[str]:
 
 
 class Bot:
-    name = "survivor-v3"
+    name = "survivor-v4"
 
     def __init__(self, hello: Dict[str, Any]) -> None:
         cfg = hello.get("config") or {}
@@ -167,7 +192,13 @@ class Bot:
             starts.append(tt)
             tt += ph.get("hold_s", 0) + ph.get("shrink_s", 0)
         self.endgame_t = starts[-2] if len(starts) >= 2 else 1e9
-        self.rng = __import__("random").Random(hello.get("seed", 0))
+        k_ie = PARAMS["inner_edge_phases"]
+        self.inner_edge_t = starts[-k_ie] if len(starts) >= k_ie else 1e9
+        # v4: recovery after a kill (position of the kill; cleared when healed and moved away)
+        self.recover_from: Optional[Tuple[float, float]] = None
+        self.hunter_c: Optional[Tuple[float, float, float]] = None  # x, y, t of last known hunter centroid
+        seed = hello.get("seed")
+        self.rng = __import__("random").Random(seed if seed is not None else 20261120)
         self.jink_sign = 1.0
         self.jink_next = 0.0
         self.dodge_until = -1.0
@@ -272,7 +303,7 @@ class Bot:
         ncx, ncy = z["next_center"]
         nr = z["next_radius"]
         inset = max(0.0, nr - min(30.0, 0.35 * nr + 3.0))
-        if obs.get("t", 0) >= self.endgame_t:
+        if obs.get("t", 0) >= min(self.endgame_t, PARAMS["final_center_t"]):
             inset = 0.0  # HP race: the circle centre stays inside longest during the last shrinks
         d = hyp(ncx, ncy, x, y)
         if d <= inset:
@@ -328,6 +359,7 @@ class Bot:
             elif et == "kill":
                 if e.get("target") == self.focus_id:
                     self.focus_id = None
+                self.recover_from = (x, y)
             elif et == "take_failed":
                 self.taken_fail[int(e.get("id", -1))] = t
         for s in obs.get("sounds") or []:
@@ -339,6 +371,34 @@ class Bot:
                     self.last_hostile_t = max(self.last_hostile_t, t - 3.0)
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
         self.detect_ffa(obs, t)
+        # v4 card A: how many distinct hunters do we know of nearby (seen, or heard < 1 s ago)
+        vis_m = [m for m in obs.get("mechs") or [] if m.get("kind") == "mech" and m.get("id") != me.get("id")]
+        near_seen = [m for m in vis_m if hyp(x, y, m["pos"][0], m["pos"][1]) < PARAMS["detail_range"]]
+        abort_seen = [m for m in vis_m if hyp(x, y, m["pos"][0], m["pos"][1]) < PARAMS["detail_abort_range"]]
+        heard: List[float] = []
+        for s in obs.get("sounds") or []:
+            if s.get("kind") in HOSTILE_SOUNDS and s.get("age", 0) < 1.0 and \
+                    SOUND_DIST.get(s.get("dist"), 110.0) < PARAMS["detail_abort_range"] and "bearing" in s:
+                b = s["bearing"]
+                # a sound on the bearing of a visible mech is that mech, not a second one
+                if not any(abs(wrap(math.atan2(m["pos"][1] - y, m["pos"][0] - x) - b)) < 0.35 for m in vis_m):
+                    if not any(abs(wrap(b - hb)) < 0.35 for hb in heard):
+                        heard.append(b)
+        n_hunters = max(len(near_seen), len(abort_seen) + len(heard))
+        if vis_m:
+            self.hunter_c = (sum(m["pos"][0] for m in vis_m) / len(vis_m),
+                             sum(m["pos"][1] for m in vis_m) / len(vis_m), t)
+        elif self.pseudo:
+            pw = sum(p[2] for p in self.pseudo)
+            self.hunter_c = (sum(p[0] * p[2] for p in self.pseudo) / pw, sum(p[1] * p[2] for p in self.pseudo) / pw, t)
+        if self.recover_from is not None and hp >= PARAMS["recover_hp"] * mhp and \
+                hyp(x, y, *self.recover_from) >= PARAMS["recover_move_m"]:
+            self.recover_from = None
+        recovering = self.recover_from is not None
+        alive_n = obs.get("alive")
+        survive = (t >= PARAMS["no_fight_t"]) or (isinstance(alive_n, int) and alive_n <= PARAMS["survive_alive"]
+                                                    and t >= PARAMS["survive_t"])
+        no_optional = survive or recovering or n_hunters > PARAMS["detail_max_hunters"]
 
         # ---- offer
         off = obs.get("offer")
@@ -421,6 +481,13 @@ class Bot:
             if hp < PARAMS["retreat_hp"] * mhp and not finishing:
                 ok = False
             ok = ok or finishing
+            if is_mech and not self.ffa:
+                # v4 defeat in detail: optional fights only 1v1 against a not-healthier hunter;
+                # finishing kills still need us to be in a 1v1
+                if finishing:
+                    ok = ok and n_hunters <= PARAMS["detail_max_hunters"] and not (survive and not attacker)
+                else:
+                    ok = ok and (not no_optional) and m_hp <= PARAMS["detail_hp_ratio"] * hp
             focus = is_mech and int(m["id"]) == self.focus_id and (t - self.focus_t) < 8.0
             if not is_mech:
                 # drones: when they shoot us, or (v3) to farm cubes while no mech is around
@@ -438,6 +505,10 @@ class Bot:
                 + (4.0 if focus else 0.0) + (3.0 if finishing else 0.0) - 1.5 * friends
             if want and sc > tscore:
                 tscore, target, fight_ok = sc, m, ok
+        if not self.ffa and t >= PARAMS["cluster_t"] and "lightning" in my_kinds:
+            clus = [m for m in enemies if hyp(x, y, m["pos"][0], m["pos"][1]) < self.light_range]
+            if len(clus) >= PARAMS["cluster_n"]:
+                target, fight_ok = clus[0], True  # packed final circle: chain lightning hits several
         self.gate_info = f"ttk_them {min(ttk_them, 999):.0f} k {k_gate:.2f} sh {len(shooters)}"
 
         # ---- movement goal
@@ -462,7 +533,7 @@ class Bot:
         silent = 0.42 * self.walk  # < 5 m/s: no step sounds
         urgent = out_now or need_speed > 0.75 * silent or (zone["shrink_start"] - t < 15 and zdist > 5)
 
-        speed = 0.4  # silent walk
+        speed = PARAMS["silent_move"]  # silent walk
         goal: Optional[Tuple[float, float]] = None
         boost = False
         mode = "idle"
@@ -474,7 +545,7 @@ class Bot:
         # so it can't regen; only when we are healthier than it and nobody else is shooting us
         chase = None
         if not fighting and not self.ffa and self.focus_id is not None and (t - self.focus_t) < 6.0 and not shooters \
-                and hp >= PARAMS["chase_min_hp"] * mhp and t < self.endgame_t:
+                and hp >= PARAMS["chase_min_hp"] * mhp and t < self.endgame_t and not no_optional:
             for m in enemies:
                 if int(m["id"]) == self.focus_id:
                     fr = m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0))
@@ -514,7 +585,7 @@ class Bot:
         elif hide_needed and self.cover is not None:
             goal = self.cover
             mode = "hide"
-            speed = 1.0 if (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < 90)) else 0.6
+            speed = 1.0 if (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < 90)) else PARAMS["silent_move"]
             if engaged and hp < mhp * 0.5 and me.get("energy", 0) > 40 and hyp(x, y, *goal) > 10:
                 boost = True
         else:
@@ -527,15 +598,26 @@ class Bot:
             if lg is not None:
                 goal = lg
                 mode = "loot"
-                speed = 0.6
+                speed = PARAMS["silent_move"]
             elif fg is not None:
                 goal = fg
                 mode = "farm-seek"
-                speed = 0.6
+                speed = PARAMS["silent_move"]
+            elif (not self.ffa and self.hunter_c is not None and t - self.hunter_c[2] < 30.0
+                  and self.inner_edge_t <= t < PARAMS["final_center_t"] and not urgent
+                  and hyp(self.hunter_c[0], self.hunter_c[1], *zone["next_center"]) > zone["next_radius"]):
+                # v4 card C: stand inside the next circle on the hunters' side so their approach runs
+                # through the zone edge (they eat zone damage, we stay in and regen)
+                ncx, ncy = zone["next_center"]
+                hb = math.atan2(self.hunter_c[1] - ncy, self.hunter_c[0] - ncx)
+                rr = PARAMS["inner_edge_frac"] * zone["next_radius"]
+                goal = (ncx + rr * math.cos(hb), ncy + rr * math.sin(hb))
+                mode = "inner-edge"
+                speed = PARAMS["silent_move"] if need_speed < 0.8 * silent else 1.0
             elif zdist > 3:
                 goal = (zgx, zgy)
                 mode = "travel"
-                speed = 0.4 if need_speed < 2.5 else 1.0
+                speed = PARAMS["silent_move"] if need_speed < 0.8 * silent else 1.0
             else:
                 # camp: hidden from the likely direction of others (zone centre)
                 if W and (self.cover is None or t - self.cover_t > 4.0) and elapsed < 6:
@@ -546,7 +628,7 @@ class Bot:
                 if self.cover is not None and self.safe_point(obs, *self.cover, t) < 1:
                     goal = self.cover
                     mode = "camp"
-                    speed = 0.4
+                    speed = PARAMS["silent_move"]
 
         mv = [0.0, 0.0]
         if goal is not None:
@@ -631,7 +713,8 @@ class Bot:
             pass
         # reload when nothing to shoot
         g0 = weapons[0] if weapons else None
-        if g0 and g0.get("kind") == "gun" and target is None and g0.get("ammo", 12) < 6 and not g0.get("reload"):
+        if g0 and g0.get("kind") == "gun" and target is None and g0.get("ammo", 12) < 6 and not g0.get("reload") \
+                and (not recent_hostile or engaged or g0.get("ammo", 12) == 0):
             act["reload"] = True
 
         self.last_aim = aim
