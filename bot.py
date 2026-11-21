@@ -138,6 +138,9 @@ PARAMS = {
     "fight_arm_range": 70.0,
     # econ trips under fire only when ttk_them >= econ_ttk_mult x the trip time
     "econ_ttk_mult": 4.0,
+    # a camp spot is kept while the zone goal is within this distance (the camp cover radius)
+    "camp_stay_m": 24.0,
+    "cube_dz": 6.0,
     # give up on a loot goal that got no closer by 2 m in this many seconds (blocked climb, bad path)
     "econ_giveup_s": 8.0,
     # I3: keep a chosen movement mode at least this long unless a hard trigger fires
@@ -732,7 +735,8 @@ class Bot:
                 goal = (ncx + rr * math.cos(hb), ncy + rr * math.sin(hb))
                 mode = "inner-edge"
                 speed = PARAMS["silent_move"] if need_speed < 0.8 * silent else 1.0
-            elif zdist > 3:
+            elif zdist > (PARAMS["camp_stay_m"] if self.cmode == "camp" else 3):
+                # I3: spatial hysteresis, a camp spot near the zone goal is kept until it drifts camp_stay_m away
                 goal = (zgx, zgy)
                 mode = "travel"
                 speed = PARAMS["silent_move"] if need_speed < 0.8 * silent else 1.0
@@ -1158,7 +1162,7 @@ class Bot:
         slot1 = weapons[1] if len(weapons) > 1 else None
         s1k = slot1.get("kind") if slot1 else None
         want_w = slot1 is None or s1k == "mortar"
-        known = self.known_mechs(t, me.get("id"))
+        known = self.known_mechs(t, me.get("id")) + [(p[0], p[1]) for p in self.pseudo if t - p[3] < 3.0]
         energy = me.get("energy", 0.0) or 0.0
         best, bc, label = None, 1e9, None
         wrange = PARAMS["arm_range"] if t < self.arm_t else PARAMS["arm_late_range"]
@@ -1196,7 +1200,7 @@ class Bot:
         crange = PARAMS["cube_range"]
         for cid, (pos, ts) in ([] if weapons_only else self.mem_cube.items()):
             px, py, pz = pos
-            if abs(pz - z) > 4 or self.econ_black.get(("q", cid), -99) > t:
+            if abs(pz - z) > PARAMS["cube_dz"] or self.econ_black.get(("q", cid), -99) > t:
                 continue
             d = hyp(x, y, px, py)
             if d > crange or self.safe_point(obs, px, py, t) >= 1:
