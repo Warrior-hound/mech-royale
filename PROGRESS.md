@@ -10,4 +10,4 @@ Change (taken from p-fight 0cfc542, without the gun-duel kiter or the lightning 
 Gates:
 - scen_fire prism gun+laser 2.33 -> 2.88 (+24%); open gun+laser 3.06 -> 3.18; gun only unchanged (1.20 / 1.80).
 - smoke PASS. docker --cpus 1 --memory 512m read-only, network none: 0 late, PASS.
-- 192-seed sim: see .cache/logs/plaser_192.log
+- 192-seed sim (seed0 1000, 5 procs, dmg_mult 0.6 defend_r 40 retaliate t_all 400 ramp_dt 60): econ2 3.46, plaser 3.49; paired +0.03 +- 0.23 (31 better / 30 worse).
