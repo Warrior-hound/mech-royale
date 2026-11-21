@@ -738,7 +738,7 @@ class Bot:
             aim, fire = self.fire_control(me, target, weapons, x, y, z, muz_h)
             if PARAMS["pacifist"] and target.get("kind") == "mech":
                 fire = [False, False]
-            if mode.startswith(("hide", "zone-cover")) and not fight_ok and not t_finish:
+            if False:
                 # v5: retreating to cover: keep aiming, but returning fire restarts our own regen
                 # clock; only a laser already charging may finish its shot
                 fire = [bool(f and wp and wp.get("kind") == "laser" and (wp.get("charge") or 0) > 0)
