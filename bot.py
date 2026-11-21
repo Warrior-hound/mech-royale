@@ -634,7 +634,10 @@ class Bot:
         time_left = max(1.0, min(zone["shrink_end"], edge_t) - t - PARAMS["zone_slack_s"])
         need_speed = plen / time_left
         silent = 0.42 * self.walk  # < 5 m/s: no step sounds
-        urgent = out_now or need_speed > 0.75 * silent or (zone["shrink_start"] - t < 15 and zdist > 5)
+        # I3: hysteresis on the rotation trigger (enter at 0.75 x silent pace, leave below 0.6 x)
+        urgent_k = 0.6 if getattr(self, "urgent_prev", False) else 0.75
+        urgent = out_now or need_speed > urgent_k * silent or (zone["shrink_start"] - t < 15 and zdist > 5)
+        self.urgent_prev = urgent
 
         speed = PARAMS["silent_move"]  # silent walk
         goal: Optional[Tuple[float, float]] = None
@@ -681,7 +684,9 @@ class Bot:
             # than the trip takes (a far gunner landing few hits)
             if econ is not None and (shooters or under_fire):
                 trip = hyp(x, y, *econ[0]) / max(1.0, self.walk) + 2.0
-                if ttk_them < PARAMS["econ_ttk_mult"] * trip:
+                # hysteresis: a trip already under way continues down to half the entry ratio
+                k_ttk = PARAMS["econ_ttk_mult"] * (0.5 if self.cmode in ("arm", "cubes", "corpse") else 1.0)
+                if ttk_them < k_ttk * trip:
                     econ = None
         if out_now or (urgent and zdist > 8):
             goal = (zgx, zgy)
