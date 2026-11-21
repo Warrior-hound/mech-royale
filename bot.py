@@ -81,6 +81,11 @@ PARAMS = {
     # fights only when <= detail_max_hunters known hunters are within detail_range and the target's
     # HP <= detail_hp_ratio x ours; any second hunter seen/heard within detail_abort_range aborts.
     "detail_range": 120.0,
+    # v5.2 card 2: evidence events (third-party HP drop > 3 drone bullets, or a death we did not cause
+    # before the first shrink) needed to switch to FFA rules. The hello has no mode field.
+    "ffa_ev_needed": 1,
+    # evidence before ffa_min_t s is ignored (cuts squad false switches; FFA replays: 75% still detected by 20 s)
+    "ffa_min_t": 8.0,
     # v5 loot: a pickup more than loot_roof_dz above the terrain under it is on a roof; before
     # loot_early_t (first hunters arrive) weapon pickups are sought up to loot_early_range.
     "loot_roof_dz": 2.0,
@@ -940,16 +945,16 @@ class Bot:
             if prev is None or t - prev[1] > 0.25 or t - self.our_hits.get(mid, -99.0) < 0.5:
                 continue
             if prev[0] - hpm >= self.ffa_drop and not any(hyp(n["pos"][0], n["pos"][1], m["pos"][0], m["pos"][1]) < 100 for n in npcs):
-                self.ffa_ev += 1
+                self.ffa_ev += 1 if t > PARAMS["ffa_min_t"] else 0
                 mf.log(f"ffa evidence: mech {mid} lost {prev[0] - hpm:.0f} HP at t={t:.1f} (not us)")
         alive = obs.get("alive")
         if isinstance(alive, int):
             zone = obs.get("zone") or {}
             if self.prev_alive is not None and alive < self.prev_alive and t - self.our_kill_t > 0.5 and                     t < (zone.get("shrink_start", 60.0) if zone.get("radius", 0) >= 500 else 0.0):
-                self.ffa_ev += 1
+                self.ffa_ev += 1 if t > PARAMS["ffa_min_t"] else 0
                 mf.log(f"ffa evidence: a mech died at t={t:.1f} (not our kill, no zone yet)")
             self.prev_alive = alive
-        if self.ffa_ev >= 2:
+        if self.ffa_ev >= PARAMS["ffa_ev_needed"]:
             self.ffa = True
             mf.log(f"FFA mode detected at t={t:.1f}")
 
